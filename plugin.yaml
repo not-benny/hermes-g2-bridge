@@ -3,7 +3,7 @@ api_version: 1
 name: hermes-g2-bridge
 label: Even Realities G2
 kind: platform
-version: 2.1.0
+version: 2.1.1
 description: >
   Authenticated Hermes gateway transport for the Hermes G2 Android app and
   Even Realities G2 glasses. It carries the private phone Device MCP and the

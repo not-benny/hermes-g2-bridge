@@ -11,6 +11,7 @@ import os
 import secrets
 import ssl
 import time
+import unicodedata
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -38,7 +39,7 @@ from .host_mcp import (
 )
 from .mcp_client import McpClient
 from .reminder_scheduler import ReminderScheduler
-from .workflow_relay import WorkflowRelay
+from .workflow_relay import WorkflowPolicyDenial, WorkflowRelay
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ class _Turn:
     event_id: str
     session_key: str
     generation: int
+    user_text: str = ""
     text: str = ""
     message_ids: set[str] = field(default_factory=set)
     finished: bool = False
@@ -130,6 +132,58 @@ class _Phone:
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     mcp_init_task: asyncio.Task | None = None
     host_mcp_init_task: asyncio.Task | None = None
+
+
+def _board_reference_tokens(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return tuple("".join(char if char.isalnum() else " " for char in normalized).split())
+
+
+def _explicit_board_reference(user_text: str, board: str) -> bool:
+    user_tokens = _board_reference_tokens(user_text)
+    board_tokens = _board_reference_tokens(board)
+    if not board_tokens or len(board_tokens) > len(user_tokens):
+        return False
+    width = len(board_tokens)
+    return any(
+        user_tokens[index : index + width] == board_tokens
+        for index in range(len(user_tokens) - width + 1)
+    )
+
+
+def _explicit_work_tasks_reference(user_text: str) -> bool:
+    user_tokens = _board_reference_tokens(user_text)
+    references = (
+        ("work", "tasks"),
+        ("work", "task"),
+        ("onboard", "tasks"),
+        ("onboard", "task"),
+        ("onboard", "task", "board"),
+        ("on", "board", "tasks"),
+        ("on", "board", "task"),
+        ("on", "board", "task", "board"),
+        ("on", "device", "tasks"),
+        ("on", "device", "task"),
+        ("on", "device", "task", "board"),
+        ("local", "tasks"),
+        ("local", "task"),
+        ("local", "task", "board"),
+        ("local", "board"),
+        ("phone", "tasks"),
+        ("phone", "task"),
+        ("phone", "task", "board"),
+        ("task", "inbox"),
+    )
+    return any(
+        reference
+        == user_tokens[index : index + len(reference)]
+        for reference in references
+        for index in range(len(user_tokens) - len(reference) + 1)
+    )
+
+
+def _explicit_kanban_reference(user_text: str) -> bool:
+    return "kanban" in _board_reference_tokens(user_text)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -928,6 +982,7 @@ class G2Adapter(BasePlatformAdapter):
             event_id=event_id,
             session_key=session_key,
             generation=generation,
+            user_text=text,
             host_binding=host_binding,
             owner_phone=phone,
             owner_host_mcp=host_mcp,
@@ -1482,8 +1537,12 @@ class G2Adapter(BasePlatformAdapter):
         raise PermissionError("Stale or inactive G2 turn")
 
     def authorize_workflow_capability(
-        self, claims: Mapping[str, Any]
-    ) -> _ToolAuthorization:
+        self,
+        claims: Mapping[str, Any],
+        *,
+        workflow: str | None = None,
+        workflow_arguments: Mapping[str, Any] | None = None,
+    ) -> _ToolAuthorization | WorkflowPolicyDenial:
         """Bind a verified workflow capability to this exact live phone turn."""
 
         event_id = claims.get("message_id")
@@ -1499,7 +1558,7 @@ class G2Adapter(BasePlatformAdapter):
             )
         except Exception:
             session_id = None
-        if (
+        authorized = (
             self._phone is not None
             and claims.get("platform") == "g2"
             and claims.get("profile") == "even-g2"
@@ -1515,14 +1574,39 @@ class G2Adapter(BasePlatformAdapter):
             # authoritative SessionStore and fail closed if it is unavailable.
             and session_id == claims.get("session_id")
             and turn.generation == route[1]
-        ):
-            return _ToolAuthorization(
-                proactive=False,
-                turn_id=turn.turn_id,
-                turn_generation=turn.generation,
-                event_id=turn.event_id,
+        )
+        if not authorized:
+            raise PermissionError(
+                "Workflow capability is not bound to the active G2 turn"
             )
-        raise PermissionError("Workflow capability is not bound to the active G2 turn")
+        work_tasks_reference = _explicit_work_tasks_reference(turn.user_text)
+        kanban_reference = _explicit_kanban_reference(turn.user_text)
+        if workflow == "g2_kanban_task_create":
+            board = (
+                workflow_arguments.get("board")
+                if isinstance(workflow_arguments, Mapping)
+                else None
+            )
+            board_named = isinstance(board, str) and _explicit_board_reference(
+                turn.user_text, board
+            )
+            if work_tasks_reference and kanban_reference:
+                return WorkflowPolicyDenial("task_board_target_conflict")
+            if work_tasks_reference:
+                return WorkflowPolicyDenial("work_tasks_requested")
+            if not board_named:
+                return WorkflowPolicyDenial("kanban_board_not_named")
+        if workflow == "g2_work_task_add":
+            if work_tasks_reference and kanban_reference:
+                return WorkflowPolicyDenial("task_board_target_conflict")
+            if not work_tasks_reference and kanban_reference:
+                return WorkflowPolicyDenial("work_tasks_not_authorized")
+        return _ToolAuthorization(
+            proactive=False,
+            turn_id=turn.turn_id,
+            turn_generation=turn.generation,
+            event_id=turn.event_id,
+        )
 
     def authorize_tool_call(self, name: str) -> _ToolAuthorization:
         from gateway.session_context import get_session_env

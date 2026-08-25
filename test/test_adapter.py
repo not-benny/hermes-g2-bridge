@@ -244,6 +244,145 @@ async def test_workflow_capability_maps_routing_key_to_exact_persisted_session_i
     adapter._phone = None
 
 
+def test_kanban_workflow_requires_current_turn_to_name_exact_board(
+    adapter, plugin_package
+):
+    module = importlib.import_module(f"{plugin_package.__name__}.adapter")
+    turn = module._Turn(
+        turn_id="kanban-turn",
+        event_id="g2-turn-19-kanban-turn",
+        session_key="agent:main:g2:dm:glasses-context-v19",
+        generation=19,
+        user_text="Add the release follow-up to the Hermes G2 board",
+    )
+    adapter._phone = SimpleNamespace()
+    adapter._turns[turn.turn_id] = turn
+    adapter._event_to_turn[turn.event_id] = (turn.turn_id, turn.generation)
+    adapter._active_turn_id = turn.turn_id
+    adapter._session_store = SimpleNamespace(
+        peek_session_id=lambda _key: "20260825_111141_bb5b0b83"
+    )
+    claims = {
+        "platform": "g2",
+        "profile": "even-g2",
+        "chat_id": adapter.session_chat_id,
+        "message_id": turn.event_id,
+        "session_id": "20260825_111141_bb5b0b83",
+    }
+
+    authorized = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Release follow-up", "board": "hermes-g2"},
+    )
+    assert authorized.turn_id == turn.turn_id
+
+    wrong_board = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Release follow-up", "board": "Default"},
+    )
+    assert wrong_board.error_code == "kanban_board_not_named"
+
+    turn.user_text = "Add this to my onboard task board"
+    onboard = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Release follow-up", "board": "Hermes G2"},
+    )
+    assert onboard.error_code == "work_tasks_requested"
+    work_tasks = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_work_task_add",
+        workflow_arguments={"title": "Release follow-up", "lane": "inbox"},
+    )
+    assert work_tasks.turn_id == turn.turn_id
+
+    for phrase in (
+        "Add this to Work Tasks",
+        "Add this to my onboard tasks",
+        "Add this to the on-device task board",
+        "Add this to my local tasks",
+        "Add this to the local task board",
+        "Add this to my phone tasks",
+        "Add this to the phone task board",
+    ):
+        turn.user_text = phrase
+        denial = adapter.authorize_workflow_capability(
+            claims,
+            workflow="g2_kanban_task_create",
+            workflow_arguments={"title": "Release follow-up", "board": "Hermes G2"},
+        )
+        assert denial.error_code == "work_tasks_requested"
+
+    turn.user_text = "Add Hermes G2 follow-up to my local tasks"
+    title_contains_board = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Hermes G2 follow-up", "board": "Hermes G2"},
+    )
+    assert title_contains_board.error_code == "work_tasks_requested"
+
+    turn.user_text = "Add this to Kanban"
+    guessed_kanban = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Release follow-up", "board": "Hermes G2"},
+    )
+    assert guessed_kanban.error_code == "kanban_board_not_named"
+    wrong_store = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_work_task_add",
+        workflow_arguments={"title": "Release follow-up", "lane": "inbox"},
+    )
+    assert wrong_store.error_code == "work_tasks_not_authorized"
+
+    turn.user_text = "Add this to Work Tasks and the Hermes G2 Kanban board"
+    conflict = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Release follow-up", "board": "Hermes G2"},
+    )
+    assert conflict.error_code == "task_board_target_conflict"
+    conflict = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_work_task_add",
+        workflow_arguments={"title": "Release follow-up", "lane": "inbox"},
+    )
+    assert conflict.error_code == "task_board_target_conflict"
+
+    turn.user_text = "Yes"
+    prior_context_guess = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Release follow-up", "board": "Hermes G2"},
+    )
+    assert prior_context_guess.error_code == "kanban_board_not_named"
+
+    turn.user_text = "Other board task, follow up on Example Customer request"
+    incident_kanban = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_kanban_task_create",
+        workflow_arguments={"title": "Follow-up", "board": "Blocker Board"},
+    )
+    assert incident_kanban.error_code == "kanban_board_not_named"
+    incident_work_tasks = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_work_task_add",
+        workflow_arguments={"title": "Follow-up", "lane": "inbox"},
+    )
+    assert incident_work_tasks.turn_id == turn.turn_id
+
+    turn.user_text = "Add a task to follow up on the release"
+    unqualified_task = adapter.authorize_workflow_capability(
+        claims,
+        workflow="g2_work_task_add",
+        workflow_arguments={"title": "Release follow-up", "lane": "inbox"},
+    )
+    assert unqualified_task.turn_id == turn.turn_id
+    adapter._phone = None
+
+
 @pytest_asyncio.fixture
 async def adapter(plugin_package, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_G2_TOKEN", "secret")

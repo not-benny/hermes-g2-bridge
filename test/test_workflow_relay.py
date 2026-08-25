@@ -57,6 +57,39 @@ def request(cap=None):
     }
 
 
+def kanban_request(
+    board: str,
+    *,
+    tool_call_id: str,
+    message_id: str = SESSION["message_id"],
+) -> dict:
+    outer_arguments = {"title": "Follow up", "board": board}
+    session = {
+        **SESSION,
+        "message_id": message_id,
+        "tool_call_id": tool_call_id,
+    }
+    cap = capability(
+        workflow="g2_kanban_task_create",
+        arguments=outer_arguments,
+        session=session,
+    )
+    return {
+        "version": 1,
+        "id": tool_call_id[-1] * 32,
+        "capability": cap,
+        "workflow": "g2_kanban_task_create",
+        "workflow_arguments": outer_arguments,
+        "tool": "g2.kanban.task.create",
+        "arguments": {
+            "operation_id": "kanban." + tool_call_id[-1] * 32,
+            **outer_arguments,
+        },
+        "subcall_id": 1,
+        "attempt": 1,
+    }
+
+
 @pytest.fixture
 def relay_parts(plugin_package, monkeypatch):
     relay_module = importlib.import_module(
@@ -72,8 +105,11 @@ def relay_parts(plugin_package, monkeypatch):
     monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
     authorized = []
 
-    def authorize(claims):
-        if any(claims.get(key) != value for key, value in SESSION.items()):
+    def authorize(claims, **_request):
+        if any(
+            claims.get(key) != SESSION[key]
+            for key in ("platform", "profile", "chat_id", "session_id", "message_id")
+        ):
             raise PermissionError("stolen turn")
         authorized.append(dict(claims))
 
@@ -85,8 +121,341 @@ async def test_valid_capability_dispatches_one_exact_allowlisted_subcall(relay_p
     relay, authorized, dispatched = relay_parts
     response = await relay._dispatch(request())
     assert response["ok"] is True
-    assert len(authorized) == 1
+    assert len(authorized) == 2
+    assert authorized[0] == authorized[1]
     assert dispatched == [("g2.work_tasks.add", request()["arguments"])]
+
+
+@pytest.mark.asyncio
+async def test_one_wearer_turn_cannot_substitute_kanban_destination(
+    relay_parts,
+):
+    relay, _authorized, dispatched = relay_parts
+    first = await relay._dispatch(
+        kanban_request("Blocker Board", tool_call_id="kanban-tool-call-1")
+    )
+    assert first["ok"] is True
+    assert len(dispatched) == 1
+
+    substituted = await relay._dispatch(
+        kanban_request("Hermes G2", tool_call_id="kanban-tool-call-2")
+    )
+    assert substituted["ok"] is True
+    substituted_result = json.loads(substituted["result"])
+    assert substituted_result == {
+        "commit_state": "not_committed",
+        "error": (
+            "Selecting a different task-board destination requires a fresh wearer "
+            "request"
+        ),
+        "error_code": "task_destination_change_requires_fresh_turn",
+        "success": False,
+    }
+    assert len(dispatched) == 1
+
+    repeated_same_board = await relay._dispatch(
+        kanban_request("Blocker Board", tool_call_id="kanban-tool-call-3")
+    )
+    assert repeated_same_board["ok"] is True
+    assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+async def test_fresh_authoritative_wearer_turn_can_select_a_new_kanban_board(
+    plugin_package,
+    monkeypatch,
+):
+    relay_module = importlib.import_module(
+        f"{plugin_package.__name__}.workflow_relay"
+    )
+    tool_module = importlib.import_module(f"{plugin_package.__name__}.tools")
+    active_message = {"value": SESSION["message_id"]}
+    dispatched = []
+
+    def authorize(claims, **_request):
+        if claims.get("message_id") != active_message["value"]:
+            raise PermissionError("stale turn")
+
+    async def dispatch(name, arguments):
+        dispatched.append((name, copy.deepcopy(arguments)))
+        return '{"success":true}'
+
+    monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
+    relay = relay_module.WorkflowRelay(authorize)
+
+    first = await relay._dispatch(
+        kanban_request("Blocker Board", tool_call_id="kanban-tool-call-4")
+    )
+    assert first["ok"] is True
+
+    active_message["value"] = "g2-turn-2-relay"
+    fresh = await relay._dispatch(
+        kanban_request(
+            "Hermes G2",
+            tool_call_id="kanban-tool-call-5",
+            message_id=active_message["value"],
+        )
+    )
+    assert fresh["ok"] is True
+    assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+async def test_board_fence_consumes_capability_replay_before_typed_rejection(
+    relay_parts,
+):
+    relay, _authorized, dispatched = relay_parts
+    first = kanban_request("Blocker Board", tool_call_id="kanban-tool-call-6")
+    substituted = kanban_request("Hermes G2", tool_call_id="kanban-tool-call-7")
+
+    assert (await relay._dispatch(first))["ok"] is True
+    rejected = await relay._dispatch(substituted)
+    assert rejected["ok"] is True
+    assert json.loads(rejected["result"])["error_code"] == (
+        "task_destination_change_requires_fresh_turn"
+    )
+
+    replay = await relay._dispatch(substituted)
+    assert replay["ok"] is False
+    assert replay["error"] == "unauthorized"
+    assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_turn_cannot_replace_fresh_turn_board_fence(
+    plugin_package,
+    monkeypatch,
+):
+    relay_module = importlib.import_module(
+        f"{plugin_package.__name__}.workflow_relay"
+    )
+    tool_module = importlib.import_module(f"{plugin_package.__name__}.tools")
+    old_message = SESSION["message_id"]
+    new_message = "g2-turn-2-relay"
+    active_message = {"value": old_message}
+    old_claim_started = asyncio.Event()
+    resume_old_claim = asyncio.Event()
+    dispatched = []
+
+    def authorize(claims, **_request):
+        if claims.get("message_id") != active_message["value"]:
+            raise PermissionError("stale turn")
+
+    async def dispatch(name, arguments):
+        dispatched.append((name, copy.deepcopy(arguments)))
+        return '{"success":true}'
+
+    monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
+    relay = relay_module.WorkflowRelay(authorize)
+    original_claim_use = relay._claim_use
+
+    async def delayed_claim_use(claims, **request_parts):
+        if claims.get("message_id") == old_message:
+            old_claim_started.set()
+            await resume_old_claim.wait()
+        await original_claim_use(claims, **request_parts)
+
+    relay._claim_use = delayed_claim_use
+    stale_task = asyncio.create_task(
+        relay._dispatch(
+            kanban_request("Old Board", tool_call_id="kanban-tool-call-8")
+        )
+    )
+    await old_claim_started.wait()
+
+    active_message["value"] = new_message
+    fresh = await relay._dispatch(
+        kanban_request(
+            "Hermes G2",
+            tool_call_id="kanban-tool-call-9",
+            message_id=new_message,
+        )
+    )
+    assert fresh["ok"] is True
+
+    resume_old_claim.set()
+    stale = await stale_task
+    assert stale["ok"] is False
+    assert stale["error"] == "unauthorized"
+
+    substituted = await relay._dispatch(
+        kanban_request(
+            "Default",
+            tool_call_id="kanban-tool-call-a",
+            message_id=new_message,
+        )
+    )
+    assert substituted["ok"] is True
+    assert json.loads(substituted["result"])["error_code"] == (
+        "task_destination_change_requires_fresh_turn"
+    )
+    assert [arguments["board"] for _name, arguments in dispatched] == [
+        "Hermes G2"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_policy_denial_is_typed_and_consumes_capability_nonce(
+    plugin_package,
+    monkeypatch,
+):
+    relay_module = importlib.import_module(
+        f"{plugin_package.__name__}.workflow_relay"
+    )
+    tool_module = importlib.import_module(f"{plugin_package.__name__}.tools")
+    dispatched = []
+
+    async def dispatch(name, arguments):
+        dispatched.append((name, arguments))
+        return '{"success":true}'
+
+    def authorize(_claims, **_request):
+        return relay_module.WorkflowPolicyDenial("work_tasks_requested")
+
+    monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
+    relay = relay_module.WorkflowRelay(authorize)
+    denied_request = kanban_request(
+        "Hermes G2", tool_call_id="kanban-tool-call-b"
+    )
+
+    denied = await relay._dispatch(denied_request)
+    assert denied["ok"] is True
+    assert json.loads(denied["result"]) == {
+        "commit_state": "not_committed",
+        "error": (
+            "The wearer requested the onboard Work Tasks board, not Hermes Kanban"
+        ),
+        "error_code": "work_tasks_requested",
+        "success": False,
+    }
+    replay = await relay._dispatch(denied_request)
+    assert replay["ok"] is False
+    assert replay["error"] == "unauthorized"
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_missing_kanban_board_cannot_fall_back_to_work_tasks_in_same_turn(
+    plugin_package,
+    monkeypatch,
+):
+    relay_module = importlib.import_module(
+        f"{plugin_package.__name__}.workflow_relay"
+    )
+    tool_module = importlib.import_module(f"{plugin_package.__name__}.tools")
+    dispatched = []
+
+    def authorize(claims, **_request):
+        if any(
+            claims.get(key) != SESSION[key]
+            for key in (
+                "platform",
+                "profile",
+                "chat_id",
+                "session_id",
+                "message_id",
+            )
+        ):
+            raise PermissionError("stolen turn")
+
+    async def dispatch(name, arguments):
+        dispatched.append((name, copy.deepcopy(arguments)))
+        if name == "g2.kanban.task.create":
+            return json.dumps({
+                "success": False,
+                "commit_state": "not_committed",
+                "error_code": "board_not_found",
+                "error": "No active Hermes Kanban board exactly matches that name",
+                "available_boards": [
+                    {"slug": "default", "name": "Default"},
+                    {"slug": "hermes-g2", "name": "Hermes G2"},
+                ],
+                "boards_truncated": False,
+            })
+        return '{"success":true}'
+
+    monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
+    relay = relay_module.WorkflowRelay(authorize)
+    kanban = await relay._dispatch(
+        kanban_request("Blocker", tool_call_id="kanban-tool-call-c")
+    )
+    assert kanban["ok"] is True
+    assert json.loads(kanban["result"])["error_code"] == "board_not_found"
+
+    work_request = request(
+        capability(
+            session={**SESSION, "tool_call_id": "work-tool-call-d"},
+        )
+    )
+    work_request["id"] = "d" * 32
+    work_request["arguments"]["operation_id"] = (
+        "task.dddddddddddddddddddddddddddddddd"
+    )
+    work = await relay._dispatch(work_request)
+    assert work["ok"] is True
+    assert json.loads(work["result"])["error_code"] == (
+        "task_destination_change_requires_fresh_turn"
+    )
+    assert [name for name, _arguments in dispatched] == [
+        "g2.kanban.task.create"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_work_tasks_turn_cannot_switch_to_kanban(relay_parts):
+    relay, _authorized, dispatched = relay_parts
+    assert (await relay._dispatch(request()))["ok"] is True
+
+    kanban = await relay._dispatch(
+        kanban_request("Hermes G2", tool_call_id="kanban-tool-call-e")
+    )
+    assert kanban["ok"] is True
+    assert json.loads(kanban["result"])["error_code"] == (
+        "task_destination_change_requires_fresh_turn"
+    )
+    assert [name for name, _arguments in dispatched] == ["g2.work_tasks.add"]
+
+
+@pytest.mark.asyncio
+async def test_policy_denied_kanban_does_not_bind_before_correct_work_tasks_call(
+    plugin_package,
+    monkeypatch,
+):
+    relay_module = importlib.import_module(
+        f"{plugin_package.__name__}.workflow_relay"
+    )
+    tool_module = importlib.import_module(f"{plugin_package.__name__}.tools")
+    dispatched = []
+
+    def authorize(_claims, *, workflow, **_request):
+        if workflow == "g2_kanban_task_create":
+            return relay_module.WorkflowPolicyDenial("work_tasks_requested")
+        return None
+
+    async def dispatch(name, arguments):
+        dispatched.append((name, copy.deepcopy(arguments)))
+        return '{"success":true}'
+
+    monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
+    relay = relay_module.WorkflowRelay(authorize)
+    denied = await relay._dispatch(
+        kanban_request("Hermes G2", tool_call_id="kanban-tool-call-f")
+    )
+    assert denied["ok"] is True
+    assert json.loads(denied["result"])["error_code"] == "work_tasks_requested"
+
+    work_request = request(
+        capability(
+            session={**SESSION, "tool_call_id": "work-tool-call-0"},
+        )
+    )
+    work_request["id"] = "0" * 32
+    work_request["arguments"]["operation_id"] = (
+        "task.00000000000000000000000000000000"
+    )
+    work = await relay._dispatch(work_request)
+    assert work["ok"] is True
+    assert [name for name, _arguments in dispatched] == ["g2.work_tasks.add"]
 
 
 @pytest.mark.asyncio
@@ -192,7 +561,7 @@ async def test_relay_rejection_stage_logs_never_expose_private_request_data(
         "arguments": copy.deepcopy(outer_arguments),
     })
 
-    def authorize(_claims):
+    def authorize(_claims, **_request):
         if rejection_stage == "active_turn":
             raise PermissionError(exception_secret)
 
@@ -312,7 +681,7 @@ async def test_multistep_workflow_must_follow_reviewed_sequence(plugin_package, 
         return '{"success":true}'
 
     monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
-    relay = relay_module.WorkflowRelay(lambda _claims: None)
+    relay = relay_module.WorkflowRelay(lambda _claims, **_request: None)
     outer_args = {"location": "Liverpool"}
     cap = capability(workflow="g2_weather_present", arguments=outer_args)
     value = request(cap)
@@ -346,7 +715,7 @@ async def test_client_disconnect_cancels_exact_inflight_native_dispatch(
             raise
 
     monkeypatch.setattr(tool_module, "dispatch_mcp_workflow", dispatch)
-    relay = relay_module.WorkflowRelay(lambda _claims: None)
+    relay = relay_module.WorkflowRelay(lambda _claims, **_request: None)
     await relay.start()
     try:
         _reader, writer = await asyncio.open_unix_connection(str(relay.socket_path))
@@ -380,7 +749,7 @@ async def test_relay_socket_is_transport_only_and_legacy_token_is_removed(
     run_dir.mkdir()
     legacy = run_dir / "g2-workflows.token"
     legacy.write_text("obsolete-readable-authority", encoding="utf-8")
-    relay = relay_module.WorkflowRelay(lambda _claims: None)
+    relay = relay_module.WorkflowRelay(lambda _claims, **_request: None)
 
     await relay.start()
     try:
