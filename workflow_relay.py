@@ -55,6 +55,7 @@ def _log_relay_rejection(stage: _RelayRejectionStage) -> None:
 # generic native-tool endpoint.
 WORKFLOW_INTERNAL_SEQUENCE: dict[str, tuple[str, ...]] = {
     "g2_work_task_add": ("g2.work_tasks.add",),
+    "g2_kanban_task_create": ("g2.kanban.task.create",),
     "g2_clock_set_timer": ("g2.clock.set_timer",),
     "g2_clock_set_alarm": ("g2.clock.set_alarm",),
     "g2_reminder_create": ("g2.reminders.create",),

@@ -61,6 +61,7 @@ rejected.
 | Voice turn, final result, cancellation | Host Session MCP | Active; no custom-channel fallback |
 | Opt-in Conversate question/topic cues | Host Session MCP → tool-free auxiliary model | Optional negotiated capability; bounded recent text including live revisions, latest-wins, 2.5 s deadline, local fallback |
 | Work Tasks add | Workflow MCP → fixed device MCP tool | Active |
+| Hermes Kanban card create | Workflow MCP → fixed canonical Kanban DB call | Active; exact existing board only, blocked + unassigned, duplicate-proof retry |
 | Clock timer/alarm set | Workflow MCP → fixed device MCP tool | Active |
 | UK train departures + final deck | Workflow MCP → typed reader + fixed present | Active |
 | UK public weather + final deck | Workflow MCP → typed reader + fixed present | Active |
@@ -79,6 +80,53 @@ rejected.
 | Calendar / printers | Separate user-configured MCPs | Remove recipes from release profile |
 | Email watches and private host scripts | Optional local integration package | Not part of the public base package |
 | Browser harness | Separate least-privilege MCP | Not part of the device authority boundary |
+
+The Kanban workflow exposes one create intent, not the raw Kanban toolset. The
+model must supply an exact existing board slug or display name. Zero or multiple
+matches return typed `board_not_found` or `board_ambiguous` output with at most
+16 canonical active board choices, and no card is written. There is no fallback
+to local Work Tasks and no implicit match against Kanban statuses or lanes.
+The exact active turn and cancellation state are revalidated after enumeration
+and immediately before any private board display names can leave the host.
+Successful cards are `blocked` and unassigned, not `triage`, because Hermes'
+default triage auto-decomposer can otherwise start model work without another
+wearer action. The create transaction records the canonical sticky-block event
+as well as the initial status, preventing dependency recomputation from
+promoting a parentless blocked card.
+
+Bridge manifest 2.1.0 enforces cross-board idempotency with an owner-only,
+profile-scoped operation ledger rather than relying on the race-tolerant
+per-board lookup alone. The ledger stores a canonical payload digest, never a
+second plaintext copy of title/body. Under a bounded POSIX `flock`, it commits
+`PREPARED`, pins the exact slug plus original DB/directory/metadata generation,
+and durably advances to `MUTATING` before any possible board write. The pinned
+DB is opened in existing-file-only mode. Its generation and active metadata are
+revalidated after open and inside `kanban_db.write_txn`; the exact live-turn
+authority and cancellation flag are checked immediately before mutation and
+again before that transaction can commit. Blocking lock and SQLite work runs
+in a worker thread, keeping cancellation/revocation processing live on the
+gateway event loop, and uses short bounded wait times.
+
+After canonical create commits, the ledger records a permanent `COMMITTED`
+tombstone containing only the stable task ID, canonical slug, and immutable
+creation facts. Retries do not resolve a display name again and cannot target a
+renamed or recreated board. Assignment, status changes, task archive/hard
+delete, board archive/delete, and display-name or slug reuse cannot cause a new
+card. Historical receipts say `created_status: blocked` and
+`created_assignee: null`; they make no claim about current card state. A
+`MUTATING` crash entry recovers only one exact, still-verifiable canonical
+idempotency row. If no such row exists, including create-then-hard-delete in the
+cross-DB crash window, the outcome remains permanently unknown and the workflow
+will not recreate. This is an intentional fail-closed availability tradeoff.
+Ledger directory/file modes are `0700`/`0600`, symlinks and hardlinks are
+rejected, and non-POSIX hosts without secure `flock`/`O_NOFOLLOW` fail closed.
+The canonical default board is the one exception to the existing-file rule:
+Hermes lists it before its legacy DB exists, so the bridge may invoke canonical
+default initialization under current authority and the global lock, before
+`PREPARED` exists. Missing named generations are never initialized. A global
+lock timeout is an exact unknown outcome, not `not_committed` or an authority
+error, because a response-loss attempt may still hold the lock while committing
+or finalizing the same identity.
 
 ## Browser Harness limited-release gap
 

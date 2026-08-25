@@ -59,6 +59,7 @@ closed; `tools/listChanged` cannot widen model authority.
 | MCP tool | Intent |
 |---|---|
 | `g2_work_task_add` | Add one phone-owned Work Tasks item |
+| `g2_kanban_task_create` | Create one blocked, unassigned card on one exact existing Hermes Kanban board |
 | `g2_clock_set_timer` | Set one durable Clock timer |
 | `g2_clock_set_alarm` | Set one durable Clock alarm |
 | `g2_reminder_create` | Create one deterministic one-shot reminder |
@@ -73,7 +74,8 @@ closed; `tools/listChanged` cannot widen model authority.
 
 There is no generic phone-tool proxy, arbitrary render/card tool, raw state
 dump, dynamic app primitive, public completed-result producer, terminal, or
-browser/Python execution tool.
+browser/Python execution tool. There is likewise no raw Kanban list, update,
+delete, comment, dispatch, or generic proxy surface.
 
 Hermes mints a short-lived HMAC capability for each call. It is bound to the
 approved package digest, stable server binding, profile, active G2 turn,
@@ -81,6 +83,46 @@ tool-call identity, workflow name, canonical arguments, expiry, and one-use
 nonce. The native relay verifies all claims and its replay ledger before a
 fixed name-to-handler dispatch. The profile-local Unix socket and same-UID
 check are transport isolation, not authority.
+
+Kanban creation matches one active board by exact case-insensitive slug or
+display name. A missing or duplicate match returns a typed result containing at
+most 16 canonical board choices and performs no mutation; it never falls back
+to the phone-owned Work Tasks app or interprets a status as a board. The bridge
+revalidates the exact active turn after board enumeration and immediately
+before any display-name choices can leave the host. Created cards are always
+`blocked` and unassigned. `triage` is deliberately not used,
+because Hermes enables its triage auto-decomposer by default. The same create
+transaction records the canonical sticky-block event; the initial status alone
+would otherwise be promoted by dependency recomputation.
+
+Bridge manifest 2.1.0 adds this fixed route. Before any board write, a
+profile-scoped owner-only SQLite ledger records a digest-only `PREPARED` intent,
+then durably advances it to `MUTATING`. The bridge holds a bounded POSIX
+`flock`, pins the original board slug and filesystem generation, opens that DB
+in existing-file-only mode, and revalidates the exact live G2 turn after it has
+the canonical board write transaction. The canonical idempotency lookup,
+`hermes_cli.kanban_db.create_task` call, sticky-block event, and final
+cancellation/authority check share that immediate transaction.
+
+After the board commit, the ledger becomes a permanent `COMMITTED` tombstone.
+It survives card assignment, archive, hard deletion, display-name reuse, and
+board deletion/recreation. Historical replies report immutable
+`created_status: blocked` and `created_assignee: null`; they never claim the
+card is still blocked or unassigned. A crash-state `MUTATING` entry may recover
+one exact canonical idempotency row, but it never creates when that row is
+absent. That deliberate availability tradeoff prevents resurrection after an
+unobserved create followed by deletion. Blocking lock/DB work runs outside the
+gateway event loop with short lock timeouts, and cancellation/revocation is
+checked again inside the still-rollback-capable transaction. The durable lock
+contract is POSIX-only and fails closed on hosts without secure `flock`,
+`O_NOFOLLOW`, and owner identity checks.
+Hermes' special canonical `default` board is advertised before its legacy DB
+file exists, so the bridge may run canonical default-board initialization while
+authority is current and before recording any operation intent. It never does
+this for a missing named board generation. A global-lock timeout is reported as
+`operation_outcome_unknown`, because another detached attempt may already be
+creating or finalizing the same operation; it is never mislabeled as an
+authority failure or `not_committed`.
 
 ## Deterministic reminders and background delivery
 

@@ -1527,6 +1527,7 @@ def test_tools_module_has_only_the_fixed_private_relay_surface(plugin_package):
         "g2.notifications.deliver_final",
         "g2.reminders.create",
         "g2.work_tasks.add",
+        "g2.kanban.task.create",
         "g2.clock.set_timer",
         "g2.clock.set_alarm",
         "g2.transit.read_departures",

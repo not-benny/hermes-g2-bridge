@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from dataclasses import dataclass
+import errno
 import json
 import hashlib
 import logging
+import os
+from pathlib import Path
 import re
+import sqlite3
+import stat
 import threading
 import time
 import unicodedata
 from datetime import date
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
+
+try:  # The G2 bridge host is POSIX; non-POSIX hosts fail closed at use time.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on unsupported hosts
+    fcntl = None  # type: ignore[assignment]
 
 from . import runtime
 from .reminder_scheduler import (
@@ -64,6 +76,35 @@ _WORK_TASK_RECEIPT_STATUSES = frozenset({
 _WORK_TASK_RECEIPT_ERROR = (
     "Work Tasks did not return an exact acknowledgement receipt"
 )
+
+_KANBAN_OPERATION_ID = re.compile(r"^kanban\.[a-f0-9]{32}$")
+_KANBAN_TASK_ID = re.compile(r"^t_[a-f0-9]{8}$")
+_KANBAN_BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_KANBAN_TITLE_MAX_SCALARS = 120
+_KANBAN_TITLE_MAX_BYTES = 480
+_KANBAN_BODY_MAX_SCALARS = 2_000
+_KANBAN_BODY_MAX_BYTES = 8_000
+_KANBAN_BOARD_INPUT_MAX_SCALARS = 80
+_KANBAN_BOARD_INPUT_MAX_BYTES = 320
+_KANBAN_BOARD_LIST_LIMIT = 16
+_KANBAN_CREATED_BY = "g2-workflows"
+_KANBAN_IDEMPOTENCY_PREFIX = "g2-kanban:"
+_KANBAN_LEDGER_SCHEMA_VERSION = 1
+_KANBAN_LEDGER_LOCK_TIMEOUT_SECONDS = 0.5
+_KANBAN_LEDGER_LOCK_POLL_SECONDS = 0.02
+_KANBAN_BOARD_BUSY_TIMEOUT_MS = 25
+_KANBAN_LEDGER_STATES = frozenset({"PREPARED", "MUTATING", "COMMITTED"})
+_KANBAN_OPERATION_ERRORS = {
+    "operation_conflict": (
+        "Kanban operation identity is already bound to different arguments"
+    ),
+    "board_generation_changed": (
+        "The selected Kanban board changed before the card was created"
+    ),
+    "operation_outcome_unknown": (
+        "Kanban creation may have started but its exact outcome is unknown"
+    ),
+}
 
 _CLOCK_TIMER_PHONE_TOOL = "glasses.clock.set_timer"
 _CLOCK_ALARM_PHONE_TOOL = "glasses.clock.set_alarm"
@@ -154,6 +195,55 @@ class _PublicReadStage(Enum):
     WEATHER_RESULT_MISSING = "weather.result_missing"
     WEATHER_CANCELLED = "weather.cancelled"
     WEATHER_COMPLETED = "weather.completed"
+
+
+class _KanbanOperationError(RuntimeError):
+    """One fixed, content-free Kanban operation failure."""
+
+    def __init__(self, error_code: str, commit_state: str) -> None:
+        if error_code not in _KANBAN_OPERATION_ERRORS:
+            raise ValueError("unsupported Kanban operation error")
+        if commit_state not in {"not_committed", "unknown", "committed"}:
+            raise ValueError("unsupported Kanban commit state")
+        super().__init__(_KANBAN_OPERATION_ERRORS[error_code])
+        self.error_code = error_code
+        self.commit_state = commit_state
+
+
+class _KanbanBoardSelectionError(RuntimeError):
+    """An exact board selection failed before an operation intent existed."""
+
+    def __init__(
+        self,
+        error_code: str,
+        available_boards: list[dict[str, str]],
+        boards_truncated: bool,
+    ) -> None:
+        if error_code not in {"board_not_found", "board_ambiguous"}:
+            raise ValueError("unsupported Kanban board selection error")
+        super().__init__(error_code)
+        self.error_code = error_code
+        self.available_boards = available_boards
+        self.boards_truncated = boards_truncated
+
+
+@dataclass(frozen=True)
+class _KanbanBoardGeneration:
+    slug: str
+    db_path: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class _KanbanLedgerEntry:
+    operation_id: str
+    payload_digest: str
+    board_slug: str
+    board_db_path: str
+    board_generation: str
+    state: str
+    task_id: str | None
+    created_status: str | None
 
 
 def _log_public_read_stage(stage: _PublicReadStage, *, failed: bool = False) -> None:
@@ -306,6 +396,813 @@ def _normalize_work_task_title(value: Any) -> str | None:
     ):
         return None
     return title
+
+
+def _normalize_kanban_line(
+    value: Any,
+    *,
+    max_scalars: int,
+    max_bytes: int,
+) -> str | None:
+    """Return bounded NFC text that is inert when stored in a Kanban card."""
+    if not isinstance(value, str):
+        return None
+    for character in value:
+        codepoint = ord(character)
+        category = unicodedata.category(character)
+        if (
+            codepoint <= 0x1F
+            or 0x7F <= codepoint <= 0x9F
+            or 0xD800 <= codepoint <= 0xDFFF
+            or codepoint in _BIDI_CONTROL_CODEPOINTS
+            or category in {"Cc", "Cs", "Zl", "Zp"}
+        ):
+            return None
+    try:
+        text = unicodedata.normalize("NFC", value).strip()
+        encoded = text.encode("utf-8")
+    except (TypeError, UnicodeError):
+        return None
+    if (
+        not text
+        or len(text) > max_scalars
+        or len(encoded) > max_bytes
+    ):
+        return None
+    return text
+
+
+def _canonical_kanban_boards(
+    kb: Any,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+    """Return exact matching data plus a bounded presentation projection."""
+    projected: list[dict[str, str]] = []
+    for metadata in kb.list_boards(include_archived=False):
+        if not isinstance(metadata, dict):
+            continue
+        slug = metadata.get("slug")
+        if not isinstance(slug, str) or _KANBAN_BOARD_SLUG.fullmatch(slug) is None:
+            continue
+        name = _normalize_kanban_line(
+            metadata.get("name"),
+            max_scalars=_KANBAN_BOARD_INPUT_MAX_SCALARS,
+            max_bytes=_KANBAN_BOARD_INPUT_MAX_BYTES,
+        )
+        projected.append({"slug": slug, "name": name or slug})
+    projected.sort(key=lambda item: (item["slug"] != "default", item["slug"]))
+    available = projected[:_KANBAN_BOARD_LIST_LIMIT]
+    return projected, available, len(projected) > _KANBAN_BOARD_LIST_LIMIT
+
+
+def _resolve_exact_kanban_board(
+    requested: str,
+    boards: list[dict[str, str]],
+) -> tuple[str | None, str | None]:
+    """Resolve one exact case-insensitive slug/display-name match."""
+    identity = unicodedata.normalize("NFC", requested).casefold()
+    matches = {
+        board["slug"]
+        for board in boards
+        if identity
+        in {
+            unicodedata.normalize("NFC", board["slug"]).casefold(),
+            unicodedata.normalize("NFC", board["name"]).casefold(),
+        }
+    }
+    if not matches:
+        return None, "board_not_found"
+    if len(matches) != 1:
+        return None, "board_ambiguous"
+    return next(iter(matches)), None
+
+
+def _kanban_payload_digest(
+    *, title: str, body: str | None, board_input: str
+) -> str:
+    """Bind an operation to normalized arguments without storing their text."""
+    canonical = json.dumps(
+        {
+            "version": 1,
+            "title": title,
+            "body": body,
+            "board": board_input,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _kanban_ledger_directory() -> Path:
+    """Return a private, profile-owned directory or fail closed."""
+    if fcntl is None or not hasattr(os, "getuid"):
+        raise RuntimeError("Kanban operation ledger requires POSIX flock")
+    raw_home = str(os.environ.get("HERMES_HOME") or "").strip()
+    profile = (
+        Path(raw_home).expanduser() if raw_home else Path.home() / ".hermes"
+    ).resolve()
+    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state_root = profile / "state"
+    state_root.mkdir(mode=0o700, exist_ok=True)
+    state_info = state_root.lstat()
+    if (
+        stat.S_ISLNK(state_info.st_mode)
+        or not stat.S_ISDIR(state_info.st_mode)
+        or state_info.st_uid != os.getuid()
+    ):
+        raise RuntimeError("Hermes profile state directory is unsafe")
+    ledger_dir = state_root / "g2-workflows"
+    ledger_dir.mkdir(mode=0o700, exist_ok=True)
+    ledger_info = ledger_dir.lstat()
+    if (
+        stat.S_ISLNK(ledger_info.st_mode)
+        or not stat.S_ISDIR(ledger_info.st_mode)
+        or ledger_info.st_uid != os.getuid()
+    ):
+        raise RuntimeError("Kanban operation ledger directory is unsafe")
+    os.chmod(ledger_dir, 0o700)
+    return ledger_dir
+
+
+def _secure_private_file(path: Path) -> int:
+    """Open one owner-only, non-symlink regular file and return its fd."""
+    required_flags = ("O_CLOEXEC", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required_flags):
+        raise RuntimeError("Secure Kanban operation files are unsupported")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_nlink != 1
+        ):
+            raise RuntimeError("Kanban operation file is unsafe")
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+@contextlib.contextmanager
+def _kanban_operation_lock(cancelled: threading.Event):
+    """Acquire the sole profile operation lock with a short hard deadline."""
+    ledger_dir = _kanban_ledger_directory()
+    lock_path = ledger_dir / "kanban-operations.lock"
+    descriptor = _secure_private_file(lock_path)
+    acquired = False
+    deadline = time.monotonic() + _KANBAN_LEDGER_LOCK_TIMEOUT_SECONDS
+    try:
+        while True:
+            if cancelled.is_set():
+                raise PermissionError("G2 turn was cancelled")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Kanban operation ledger is busy") from None
+                time.sleep(_KANBAN_LEDGER_LOCK_POLL_SECONDS)
+        yield ledger_dir
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _connect_kanban_ledger(ledger_dir: Path) -> sqlite3.Connection:
+    """Open and verify the private durable ledger under the held flock."""
+    db_path = ledger_dir / "kanban-operations.sqlite3"
+    descriptor = _secure_private_file(db_path)
+    before = os.fstat(descriptor)
+    os.close(descriptor)
+    conn = sqlite3.connect(
+        db_path,
+        isolation_level=None,
+        timeout=0.1,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=100")
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA trusted_schema=OFF")
+        conn.execute("PRAGMA secure_delete=ON")
+        after = db_path.lstat()
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_uid != os.getuid()
+            or after.st_nlink != 1
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise RuntimeError("Kanban operation ledger identity changed")
+        version_row = conn.execute("PRAGMA user_version").fetchone()
+        version = int(version_row[0]) if version_row is not None else -1
+        if version not in {0, _KANBAN_LEDGER_SCHEMA_VERSION}:
+            raise RuntimeError("Kanban operation ledger schema is unsupported")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS operations (
+                operation_id TEXT PRIMARY KEY,
+                payload_digest TEXT NOT NULL,
+                board_slug TEXT NOT NULL,
+                board_db_path TEXT NOT NULL,
+                board_generation TEXT NOT NULL,
+                state TEXT NOT NULL,
+                task_id TEXT,
+                created_status TEXT,
+                created_assignee TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK (state IN ('PREPARED', 'MUTATING', 'COMMITTED')),
+                CHECK (created_assignee IS NULL)
+            );
+            """
+        )
+        if version == 0:
+            conn.execute(f"PRAGMA user_version={_KANBAN_LEDGER_SCHEMA_VERSION}")
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(operations)")
+        }
+        if columns != {
+            "operation_id",
+            "payload_digest",
+            "board_slug",
+            "board_db_path",
+            "board_generation",
+            "state",
+            "task_id",
+            "created_status",
+            "created_assignee",
+            "created_at",
+            "updated_at",
+        }:
+            raise RuntimeError("Kanban operation ledger schema is malformed")
+        check = conn.execute("PRAGMA quick_check").fetchone()
+        if check is None or str(check[0]).lower() != "ok":
+            raise RuntimeError("Kanban operation ledger failed integrity check")
+        os.chmod(db_path, 0o600)
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+@contextlib.contextmanager
+def _ledger_write(conn: sqlite3.Connection):
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except Exception:
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
+
+
+def _read_kanban_ledger_entry(
+    conn: sqlite3.Connection, operation_id: str
+) -> _KanbanLedgerEntry | None:
+    row = conn.execute(
+        "SELECT operation_id, payload_digest, board_slug, board_db_path, "
+        "board_generation, state, task_id, created_status, created_assignee "
+        "FROM operations WHERE operation_id = ?",
+        (operation_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    entry = _KanbanLedgerEntry(
+        operation_id=str(row["operation_id"]),
+        payload_digest=str(row["payload_digest"]),
+        board_slug=str(row["board_slug"]),
+        board_db_path=str(row["board_db_path"]),
+        board_generation=str(row["board_generation"]),
+        state=str(row["state"]),
+        task_id=str(row["task_id"]) if row["task_id"] is not None else None,
+        created_status=(
+            str(row["created_status"])
+            if row["created_status"] is not None
+            else None
+        ),
+    )
+    if (
+        entry.operation_id != operation_id
+        or _KANBAN_OPERATION_ID.fullmatch(entry.operation_id) is None
+        or re.fullmatch(r"[a-f0-9]{64}", entry.payload_digest) is None
+        or _KANBAN_BOARD_SLUG.fullmatch(entry.board_slug) is None
+        or re.fullmatch(r"[a-f0-9]{64}", entry.board_generation) is None
+        or entry.state not in _KANBAN_LEDGER_STATES
+        or row["created_assignee"] is not None
+        or (
+            entry.state == "COMMITTED"
+            and (
+                entry.task_id is None
+                or _KANBAN_TASK_ID.fullmatch(entry.task_id) is None
+                or entry.created_status != "blocked"
+            )
+        )
+        or (
+            entry.state != "COMMITTED"
+            and (entry.task_id is not None or entry.created_status is not None)
+        )
+    ):
+        raise RuntimeError("Kanban operation ledger row is malformed")
+    return entry
+
+
+def _insert_kanban_intent(
+    conn: sqlite3.Connection,
+    *,
+    operation_id: str,
+    payload_digest: str,
+    generation: _KanbanBoardGeneration,
+) -> _KanbanLedgerEntry:
+    now = int(time.time())
+    with _ledger_write(conn):
+        conn.execute(
+            "INSERT INTO operations (operation_id, payload_digest, board_slug, "
+            "board_db_path, board_generation, state, task_id, created_status, "
+            "created_assignee, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'PREPARED', NULL, NULL, NULL, ?, ?)",
+            (
+                operation_id,
+                payload_digest,
+                generation.slug,
+                generation.db_path,
+                generation.fingerprint,
+                now,
+                now,
+            ),
+        )
+    entry = _read_kanban_ledger_entry(conn, operation_id)
+    if entry is None:
+        raise RuntimeError("Kanban operation intent was not persisted")
+    return entry
+
+
+def _mark_kanban_mutating(
+    conn: sqlite3.Connection, operation_id: str
+) -> _KanbanLedgerEntry:
+    with _ledger_write(conn):
+        cursor = conn.execute(
+            "UPDATE operations SET state = 'MUTATING', updated_at = ? "
+            "WHERE operation_id = ? AND state = 'PREPARED'",
+            (int(time.time()), operation_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Kanban operation intent could not be advanced")
+    entry = _read_kanban_ledger_entry(conn, operation_id)
+    if entry is None or entry.state != "MUTATING":
+        raise RuntimeError("Kanban operation mutation intent was not persisted")
+    return entry
+
+
+def _finalize_kanban_ledger(
+    conn: sqlite3.Connection, *, operation_id: str, task_id: str
+) -> None:
+    with _ledger_write(conn):
+        cursor = conn.execute(
+            "UPDATE operations SET state = 'COMMITTED', task_id = ?, "
+            "created_status = 'blocked', created_assignee = NULL, updated_at = ? "
+            "WHERE operation_id = ? AND state = 'MUTATING'",
+            (task_id, int(time.time()), operation_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Kanban operation receipt could not be finalized")
+
+
+def _path_identity(path: Path, *, directory: bool) -> tuple[int, int]:
+    info = path.lstat()
+    expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if stat.S_ISLNK(info.st_mode) or not expected:
+        raise RuntimeError("Kanban board path is unsafe")
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _kanban_board_generation(
+    kb: Any,
+    board: str,
+    *,
+    expected_db_path: str | None = None,
+) -> _KanbanBoardGeneration:
+    """Fingerprint one active canonical board without following descendants."""
+    root = Path(kb.kanban_home()).expanduser().resolve(strict=True)
+    lexical_db_path = Path(kb.kanban_db_path(board)).expanduser()
+    if not lexical_db_path.is_absolute():
+        lexical_db_path = Path.cwd() / lexical_db_path
+    lexical_db_path = Path(os.path.abspath(lexical_db_path))
+    try:
+        relative_parts = lexical_db_path.relative_to(root).parts
+    except ValueError as exc:
+        raise RuntimeError("Kanban board path escaped its canonical root") from exc
+    current = root
+    for index, part in enumerate(relative_parts):
+        current = current / part
+        _path_identity(current, directory=index < len(relative_parts) - 1)
+    resolved_db_path = str(lexical_db_path.resolve(strict=True))
+    if resolved_db_path != str(lexical_db_path):
+        raise RuntimeError("Kanban board path contains a symlink")
+    if expected_db_path is not None and resolved_db_path != expected_db_path:
+        raise RuntimeError("Kanban board path changed")
+    metadata = kb.read_board_metadata(board)
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("slug") != board
+        or metadata.get("archived") is not False
+    ):
+        raise RuntimeError("Kanban board is no longer active")
+    metadata_path = Path(kb.board_metadata_path(board)).expanduser()
+    metadata_identity: tuple[int, int] | None = None
+    if metadata_path.exists() or metadata_path.is_symlink():
+        metadata_identity = _path_identity(metadata_path, directory=False)
+        if str(metadata_path.resolve(strict=True)) != str(
+            Path(os.path.abspath(metadata_path))
+        ):
+            raise RuntimeError("Kanban board metadata path contains a symlink")
+    created_at = metadata.get("created_at")
+    if type(created_at) is not int or created_at < 0:
+        created_at = None
+    identity = {
+        "version": 1,
+        "slug": board,
+        "db_path": resolved_db_path,
+        "db_identity": _path_identity(lexical_db_path, directory=False),
+        "directory_identity": _path_identity(
+            lexical_db_path.parent, directory=True
+        ),
+        "metadata_identity": metadata_identity,
+        "created_at": created_at,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return _KanbanBoardGeneration(board, resolved_db_path, fingerprint)
+
+
+def _initialize_fresh_default_kanban_board(
+    kb: Any, *, reauthorize: Callable[[], None]
+) -> None:
+    """Materialize only Hermes' special always-present default board."""
+    path = Path(kb.kanban_db_path("default")).expanduser()
+    if path.is_symlink():
+        raise RuntimeError("Default Kanban DB path is a symlink")
+    needs_init = not path.exists()
+    if not needs_init:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("Default Kanban DB path is unsafe")
+        needs_init = info.st_size == 0
+    if not needs_init:
+        return
+    # Canonical Hermes advertises `default` even before its legacy DB exists.
+    # Initialize that one special board before PREPARED/MUTATING exists; named
+    # boards never take this path, so a missing archived/deleted generation is
+    # still never recreated. Revalidate around initialization because it can
+    # perform first-open schema work, but cannot create a card.
+    reauthorize()
+    kb.init_db(board="default")
+    reauthorize()
+
+
+def _open_existing_kanban_board(
+    generation: _KanbanBoardGeneration,
+) -> sqlite3.Connection:
+    """Open the pinned DB in mode=rw so a missing board is never recreated."""
+    path = Path(generation.db_path)
+    uri = path.as_uri() + "?mode=rw"
+    conn = sqlite3.connect(
+        uri,
+        uri=True,
+        isolation_level=None,
+        timeout=_KANBAN_BOARD_BUSY_TIMEOUT_MS / 1_000,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={_KANBAN_BOARD_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA trusted_schema=OFF")
+        sentinel = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'tasks' LIMIT 1"
+        ).fetchone()
+        if sentinel is None:
+            raise RuntimeError("Kanban board schema is unavailable")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def _verify_parked_kanban_task(
+    kb: Any,
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    idempotency_key: str,
+    title: str,
+    body: str | None,
+) -> Any:
+    task = kb.get_task(conn, task_id)
+    created_events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' "
+        "ORDER BY id ASC LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    try:
+        created_payload = (
+            json.loads(created_events[0]["payload"])
+            if len(created_events) == 1 and created_events[0]["payload"]
+            else None
+        )
+    except (TypeError, json.JSONDecodeError):
+        created_payload = None
+    if (
+        task is None
+        or task.idempotency_key != idempotency_key
+        or task.created_by != _KANBAN_CREATED_BY
+        or task.title != title
+        or task.body != body
+        or task.status != "blocked"
+        or task.assignee is not None
+        or _KANBAN_TASK_ID.fullmatch(task.id) is None
+        or not isinstance(created_payload, dict)
+        or created_payload.get("status") != "blocked"
+        or created_payload.get("assignee") is not None
+        or not kb._has_sticky_block(conn, task.id)
+    ):
+        raise _KanbanOperationError("operation_outcome_unknown", "unknown")
+    return task
+
+
+def _committed_kanban_receipt(
+    entry: _KanbanLedgerEntry, *, historical: bool
+) -> dict[str, Any]:
+    if (
+        entry.state != "COMMITTED"
+        or entry.task_id is None
+        or entry.created_status != "blocked"
+    ):
+        raise RuntimeError("Kanban operation receipt is incomplete")
+    return {
+        "status": (
+            "historical_acknowledgement" if historical else "acknowledged"
+        ),
+        "operation_id": entry.operation_id,
+        "task_id": entry.task_id,
+        "created_status": "blocked",
+        "created_assignee": None,
+        "board": entry.board_slug,
+    }
+
+
+def _execute_kanban_task_create(
+    kb: Any,
+    *,
+    operation_id: str,
+    title: str,
+    body: str | None,
+    board_input: str,
+    session_id: str | None,
+    reauthorize: Callable[[], None],
+    cancelled: threading.Event,
+) -> dict[str, Any]:
+    """Create/recover once under a durable global tombstone and board txn."""
+    payload_digest = _kanban_payload_digest(
+        title=title, body=body, board_input=board_input
+    )
+    idempotency_key = _KANBAN_IDEMPOTENCY_PREFIX + operation_id
+    append_event = getattr(kb, "_append_event", None)
+    has_sticky_block = getattr(kb, "_has_sticky_block", None)
+    if not callable(append_event) or not callable(has_sticky_block):
+        raise RuntimeError("Canonical sticky-block support is unavailable")
+
+    with _kanban_operation_lock(cancelled) as ledger_dir:
+        reauthorize()
+        with contextlib.closing(_connect_kanban_ledger(ledger_dir)) as ledger:
+            entry = _read_kanban_ledger_entry(ledger, operation_id)
+            # Ledger open/integrity work is bounded but can still outlive the
+            # exact turn. Recheck before returning any historical/conflict fact.
+            reauthorize()
+            if entry is not None and entry.payload_digest != payload_digest:
+                commit_state = {
+                    "PREPARED": "not_committed",
+                    "MUTATING": "unknown",
+                    "COMMITTED": "committed",
+                }[entry.state]
+                raise _KanbanOperationError("operation_conflict", commit_state)
+            if entry is not None and entry.state == "COMMITTED":
+                reauthorize()
+                return _committed_kanban_receipt(entry, historical=True)
+            if entry is None:
+                matching, available, truncated = _canonical_kanban_boards(kb)
+                board, board_error = _resolve_exact_kanban_board(
+                    board_input, matching
+                )
+                if board_error is not None or board is None:
+                    # Canonical display names can be private profile data. The
+                    # listing may have outlived/released its active turn, so do
+                    # not let bounded choices escape without one exact final
+                    # cancellation/authority check under the still-held lock.
+                    reauthorize()
+                    raise _KanbanBoardSelectionError(
+                        board_error or "board_not_found", available, truncated
+                    )
+                reauthorize()
+                if board == "default":
+                    _initialize_fresh_default_kanban_board(
+                        kb, reauthorize=reauthorize
+                    )
+                generation = _kanban_board_generation(kb, board)
+                reauthorize()
+                entry = _insert_kanban_intent(
+                    ledger,
+                    operation_id=operation_id,
+                    payload_digest=payload_digest,
+                    generation=generation,
+                )
+            generation = _KanbanBoardGeneration(
+                entry.board_slug,
+                entry.board_db_path,
+                entry.board_generation,
+            )
+            try:
+                current_generation = _kanban_board_generation(
+                    kb,
+                    entry.board_slug,
+                    expected_db_path=entry.board_db_path,
+                )
+            except Exception as exc:
+                state = "unknown" if entry.state == "MUTATING" else "not_committed"
+                raise _KanbanOperationError(
+                    "operation_outcome_unknown"
+                    if state == "unknown"
+                    else "board_generation_changed",
+                    state,
+                ) from exc
+            if current_generation.fingerprint != entry.board_generation:
+                state = "unknown" if entry.state == "MUTATING" else "not_committed"
+                raise _KanbanOperationError(
+                    "operation_outcome_unknown"
+                    if state == "unknown"
+                    else "board_generation_changed",
+                    state,
+                )
+            try:
+                reauthorize()
+            except Exception as exc:
+                if entry.state == "MUTATING":
+                    raise _KanbanOperationError(
+                        "operation_outcome_unknown", "unknown"
+                    ) from exc
+                raise
+
+            may_create = entry.state == "PREPARED"
+            if may_create:
+                entry = _mark_kanban_mutating(ledger, operation_id)
+
+            created_now = False
+            try:
+                with contextlib.closing(
+                    _open_existing_kanban_board(generation)
+                ) as conn:
+                    opened_generation = _kanban_board_generation(
+                        kb,
+                        entry.board_slug,
+                        expected_db_path=entry.board_db_path,
+                    )
+                    if opened_generation.fingerprint != entry.board_generation:
+                        raise _KanbanOperationError(
+                            "operation_outcome_unknown", "unknown"
+                        )
+                    with kb.write_txn(conn):
+                        locked_generation = _kanban_board_generation(
+                            kb,
+                            entry.board_slug,
+                            expected_db_path=entry.board_db_path,
+                        )
+                        if locked_generation.fingerprint != entry.board_generation:
+                            raise _KanbanOperationError(
+                                "operation_outcome_unknown", "unknown"
+                            )
+                        try:
+                            reauthorize()
+                        except Exception as exc:
+                            raise _KanbanOperationError(
+                                "operation_outcome_unknown", "unknown"
+                            ) from exc
+                        existing = conn.execute(
+                            "SELECT id FROM tasks WHERE idempotency_key = ? "
+                            "ORDER BY created_at ASC, id ASC LIMIT 2",
+                            (idempotency_key,),
+                        ).fetchall()
+                        if len(existing) > 1:
+                            raise _KanbanOperationError(
+                                "operation_outcome_unknown", "unknown"
+                            )
+                        if existing:
+                            task_id = str(existing[0]["id"])
+                        elif may_create:
+                            task_id = kb.create_task(
+                                conn,
+                                title=title,
+                                body=body,
+                                assignee=None,
+                                created_by=_KANBAN_CREATED_BY,
+                                workspace_kind="scratch",
+                                triage=False,
+                                idempotency_key=idempotency_key,
+                                initial_status="blocked",
+                                session_id=session_id,
+                                board=entry.board_slug,
+                                # Keep this parked capture independent of a
+                                # board-scoped Project lookup/worktree. Besides
+                                # matching the no-auto-run contract, this avoids
+                                # an unrelated projects DB wait inside the final
+                                # authority-bound board transaction.
+                                project_id="",
+                            )
+                            created_now = True
+                        else:
+                            raise _KanbanOperationError(
+                                "operation_outcome_unknown", "unknown"
+                            )
+                        task = kb.get_task(conn, task_id)
+                        if created_now and task is not None and not has_sticky_block(
+                            conn, task.id
+                        ):
+                            append_event(
+                                conn,
+                                task.id,
+                                "blocked",
+                                {
+                                    "reason": (
+                                        "parked by explicit G2 Kanban creation"
+                                    ),
+                                    "kind": "needs_input",
+                                    "source_status": "ready",
+                                },
+                            )
+                        task = _verify_parked_kanban_task(
+                            kb,
+                            conn,
+                            task_id=task_id,
+                            idempotency_key=idempotency_key,
+                            title=title,
+                            body=body,
+                        )
+                        # Cancellation/revocation can arrive while canonical
+                        # create/event verification is running in this worker.
+                        # Recheck while the IMMEDIATE transaction is still
+                        # rollback-capable; after COMMIT, complete the durable
+                        # ledger tombstone even if the awaiting coroutine has
+                        # already gone away.
+                        try:
+                            reauthorize()
+                        except Exception as exc:
+                            raise _KanbanOperationError(
+                                "operation_outcome_unknown", "unknown"
+                            ) from exc
+            except _KanbanOperationError:
+                raise
+            except Exception as exc:
+                raise _KanbanOperationError(
+                    "operation_outcome_unknown", "unknown"
+                ) from exc
+
+            try:
+                post_generation = _kanban_board_generation(
+                    kb,
+                    entry.board_slug,
+                    expected_db_path=entry.board_db_path,
+                )
+            except Exception as exc:
+                raise _KanbanOperationError(
+                    "operation_outcome_unknown", "unknown"
+                ) from exc
+            if post_generation.fingerprint != entry.board_generation:
+                raise _KanbanOperationError(
+                    "operation_outcome_unknown", "unknown"
+                )
+            _finalize_kanban_ledger(
+                ledger, operation_id=operation_id, task_id=task.id
+            )
+            committed = _read_kanban_ledger_entry(ledger, operation_id)
+            if committed is None:
+                raise RuntimeError("Kanban operation receipt disappeared")
+            return _committed_kanban_receipt(
+                committed, historical=not created_now
+            )
 
 
 def _normalize_clock_label(value: Any) -> str | None:
@@ -769,6 +1666,196 @@ async def _handle_work_task_add(args: dict[str, Any], **_kwargs: Any) -> str:
         if commit_state == "unknown":
             response["operation_id"] = operation_id
         return json.dumps(response)
+
+
+async def _handle_kanban_task_create(args: dict[str, Any], **_kwargs: Any) -> str:
+    """Create one blocked, unassigned card on one exact existing board."""
+    if _current_session_platform() != "g2":
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "Hermes Kanban creation requires an active G2 turn",
+        })
+    if (
+        not isinstance(args, dict)
+        or not {"operation_id", "title", "board"} <= set(args)
+        or not set(args) <= {"operation_id", "title", "body", "board"}
+    ):
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": (
+                "operation_id, title, board, and optional body are the only "
+                "accepted fields"
+            ),
+        })
+    operation_id = args.get("operation_id")
+    title = _normalize_kanban_line(
+        args.get("title"),
+        max_scalars=_KANBAN_TITLE_MAX_SCALARS,
+        max_bytes=_KANBAN_TITLE_MAX_BYTES,
+    )
+    board_input = _normalize_kanban_line(
+        args.get("board"),
+        max_scalars=_KANBAN_BOARD_INPUT_MAX_SCALARS,
+        max_bytes=_KANBAN_BOARD_INPUT_MAX_BYTES,
+    )
+    body = None
+    if "body" in args:
+        body = _normalize_kanban_line(
+            args.get("body"),
+            max_scalars=_KANBAN_BODY_MAX_SCALARS,
+            max_bytes=_KANBAN_BODY_MAX_BYTES,
+        )
+    if not isinstance(operation_id, str) or _KANBAN_OPERATION_ID.fullmatch(
+        operation_id
+    ) is None:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "operation_id is not a trusted Kanban operation identity",
+        })
+    if title is None:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "title must be one bounded inert line",
+        })
+    if board_input is None:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "board must be one bounded exact board slug or display name",
+        })
+    if "body" in args and body is None:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "body must be one bounded inert line",
+        })
+
+    try:
+        active_authorization = await _authorize_active_g2_read()
+    except Exception:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "Hermes Kanban requires the exact current G2 turn",
+        })
+
+    adapter = runtime.get_active()
+    try:
+        current_authorization = (
+            adapter.authorize_active_g2_turn() if adapter is not None else None
+        )
+    except Exception:
+        current_authorization = None
+    if current_authorization != active_authorization:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "G2 turn authority expired before Kanban creation",
+        })
+
+    cancelled = threading.Event()
+
+    def reauthorize() -> None:
+        if cancelled.is_set() or runtime.get_active() is not adapter:
+            raise PermissionError("G2 turn authority expired")
+        try:
+            authorization = adapter.authorize_active_g2_turn()
+        except Exception as exc:
+            raise PermissionError("G2 turn authority expired") from exc
+        if authorization != active_authorization:
+            raise PermissionError("G2 turn authority changed")
+
+    try:
+        from hermes_cli import kanban_db as kb
+        from gateway.session_context import get_session_env
+
+        if str(os.environ.get("HERMES_KANBAN_DB") or "").strip():
+            raise RuntimeError("a pinned Kanban DB cannot prove board identity")
+        session_id = str(get_session_env("HERMES_SESSION_ID") or "").strip() or None
+        receipt = await asyncio.to_thread(
+            _execute_kanban_task_create,
+            kb,
+            operation_id=operation_id,
+            title=title,
+            body=body,
+            board_input=board_input,
+            session_id=session_id,
+            reauthorize=reauthorize,
+            cancelled=cancelled,
+        )
+        return json.dumps(
+            {"success": True, "receipt": receipt},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except asyncio.CancelledError:
+        cancelled.set()
+        raise
+    except _KanbanBoardSelectionError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "commit_state": "not_committed",
+                "error_code": exc.error_code,
+                "error": (
+                    "No active Hermes Kanban board exactly matches that name"
+                    if exc.error_code == "board_not_found"
+                    else (
+                        "More than one active Hermes Kanban board has that "
+                        "exact name"
+                    )
+                ),
+                "available_boards": exc.available_boards,
+                "boards_truncated": exc.boards_truncated,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except _KanbanOperationError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "commit_state": exc.commit_state,
+                "operation_id": operation_id,
+                "error_code": exc.error_code,
+                "error": _KANBAN_OPERATION_ERRORS[exc.error_code],
+            },
+            separators=(",", ":"),
+        )
+    except TimeoutError:
+        # Another same-profile operation may be creating or finalizing this
+        # exact identity while it holds the global flock. Without reading its
+        # ledger row we cannot truthfully claim `not_committed` (especially on
+        # response-loss attempt 2), and lock contention is not an auth error.
+        return json.dumps(
+            {
+                "success": False,
+                "commit_state": "unknown",
+                "operation_id": operation_id,
+                "error_code": "operation_outcome_unknown",
+                "error": _KANBAN_OPERATION_ERRORS[
+                    "operation_outcome_unknown"
+                ],
+            },
+            separators=(",", ":"),
+        )
+    except PermissionError:
+        return json.dumps({
+            "success": False,
+            "commit_state": "not_committed",
+            "error": "G2 turn authority expired before Kanban creation",
+        })
+    except Exception:
+        return json.dumps({
+            "success": False,
+            "commit_state": "unknown",
+            "operation_id": operation_id,
+            "error": "Hermes Kanban creation outcome is unknown",
+        })
 
 
 def _clock_failure(operation_id: str, exc: Exception) -> str:
@@ -1726,6 +2813,7 @@ _MCP_WORKFLOW_HANDLERS = {
     "g2.notifications.deliver_final": _handle_notify_result,
     "g2.reminders.create": _handle_schedule_reminder,
     "g2.work_tasks.add": _handle_work_task_add,
+    "g2.kanban.task.create": _handle_kanban_task_create,
     "g2.clock.set_timer": _handle_clock_set_timer,
     "g2.clock.set_alarm": _handle_clock_set_alarm,
     "g2.transit.read_departures": _handle_train_departures,
