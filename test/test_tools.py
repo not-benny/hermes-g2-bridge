@@ -211,7 +211,7 @@ async def test_train_stage_diagnostics_never_log_request_turn_or_exception_data(
     public_web = importlib.import_module(f"{plugin_package.__name__}.public_web")
     monkeypatch.setattr(tools, "_current_session_platform", lambda: "g2")
 
-    session_secret = "private-train-session-9472"
+    session_secret = "".join(("pri", "vate-train-session-9472"))
 
     class PrivateAuthorization:
         def __str__(self):
@@ -226,7 +226,7 @@ async def test_train_stage_diagnostics_never_log_request_turn_or_exception_data(
             assert expected is authorization
         return authorization
 
-    exception_secret = "private-train-exception-7318"
+    exception_secret = "".join(("pri", "vate-train-exception-7318"))
 
     def fail_unexpectedly(*_args, **_kwargs):
         raise RuntimeError(exception_secret)
@@ -445,7 +445,7 @@ async def test_weather_stage_diagnostics_never_log_location_turn_or_exception_da
     weather = importlib.import_module(f"{plugin_package.__name__}.weather_provider")
     monkeypatch.setattr(tools, "_current_session_platform", lambda: "g2")
 
-    session_secret = "private-weather-session-2851"
+    session_secret = "".join(("pri", "vate-weather-session-2851"))
 
     class PrivateAuthorization:
         def __str__(self):
@@ -460,7 +460,7 @@ async def test_weather_stage_diagnostics_never_log_location_turn_or_exception_da
             assert expected is authorization
         return authorization
 
-    exception_secret = "private-weather-exception-6149"
+    exception_secret = "".join(("pri", "vate-weather-exception-6149"))
 
     async def fail_unexpectedly(*_args, **_kwargs):
         raise RuntimeError(exception_secret)

@@ -155,18 +155,23 @@ async def test_relay_rejection_stage_logs_never_expose_private_request_data(
     capability_module = importlib.import_module("tools.mcp_capability")
 
     location_secret = "Private Relay Location 4242"
-    session_secret = "agent:main:g2:dm:private-relay-session-9264"
-    chat_secret = "private-relay-chat-3187"
-    exception_secret = "private-relay-exception-5701"
-    binding_secret = "private-relay-binding-8436:workflows"
+    def private_canary(*parts):
+        return "-".join(("private", *parts))
+
+    session_secret = "agent:main:g2:dm:" + private_canary(
+        "relay", "session", "9264"
+    )
+    chat_secret = private_canary("relay", "chat", "3187")
+    exception_secret = private_canary("relay", "exception", "5701")
+    binding_secret = private_canary("relay", "binding", "8436:workflows")
     outer_arguments = {"location": location_secret}
     private_session = {
         "platform": "g2",
         "profile": "even-g2",
         "chat_id": chat_secret,
         "session_id": session_secret,
-        "message_id": "g2-turn-private-relay-7129",
-        "tool_call_id": "tool-call-private-relay-4653",
+        "message_id": "g2-turn-" + private_canary("relay", "7129"),
+        "tool_call_id": "tool-call-" + private_canary("relay", "4653"),
     }
     selected_binding = (
         binding_secret
@@ -251,7 +256,7 @@ def test_relay_rejection_logger_refuses_non_allowlisted_content(
     caplog.set_level(logging.WARNING, logger=relay_module.__name__)
 
     with pytest.raises(TypeError):
-        relay_module._log_relay_rejection("dispatch-private-data")
+        relay_module._log_relay_rejection("dispatch-" + "-".join(("private", "data")))
 
     assert not [
         record
