@@ -95,7 +95,17 @@ because Hermes enables its triage auto-decomposer by default. The same create
 transaction records the canonical sticky-block event; the initial status alone
 would otherwise be promoted by dependency recomputation.
 
-Bridge manifest 2.1.0 adds this fixed route. Before any board write, a
+Bridge manifest 2.1.1 adds a current-turn destination fence to this fixed
+route. The wearer must name the exact Kanban board in the current turn;
+explicit onboard, local, phone, or Work Tasks wording is never Kanban
+authority. A missing or ambiguous selection cannot be replaced with a
+different Kanban board or the phone's Work Tasks store in the same turn.
+Multiple items may still be created for the same authorized destination.
+The fence compares the normalized submitted board identity; changing between a
+display-name and slug spelling requires a fresh turn even if both later resolve
+to the same canonical board.
+
+Before any board write, a
 profile-scoped owner-only SQLite ledger records a digest-only `PREPARED` intent,
 then durably advances it to `MUTATING`. The bridge holds a bounded POSIX
 `flock`, pins the original board slug and filesystem generation, opens that DB
@@ -123,6 +133,9 @@ this for a missing named board generation. A global-lock timeout is reported as
 `operation_outcome_unknown`, because another detached attempt may already be
 creating or finalizing the same operation; it is never mislabeled as an
 authority failure or `not_committed`.
+
+The reviewed all-in-one installer and exact component locks are published in
+[`hermes-g2-distribution`](https://github.com/not-benny/hermes-g2-distribution).
 
 ## Deterministic reminders and background delivery
 

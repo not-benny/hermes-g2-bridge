@@ -8,6 +8,7 @@ exact package digest, public workflow, argument object and active G2 turn.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import socket
 import stat
 import struct
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -125,6 +127,52 @@ class _CapabilityUse:
     subcalls: dict[int, _SubcallUse] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _TaskTurnDestination:
+    destination: str
+
+
+_WORKFLOW_POLICY_ERRORS = {
+    "work_tasks_requested": (
+        "The wearer requested the onboard Work Tasks board, not Hermes Kanban"
+    ),
+    "kanban_board_not_named": (
+        "The current wearer request did not name this Hermes Kanban board"
+    ),
+    "task_board_target_conflict": (
+        "The wearer request names conflicting task-board destinations; ask which "
+        "one in a fresh turn"
+    ),
+    "work_tasks_not_authorized": (
+        "The wearer requested Hermes Kanban; ask for its exact board in a fresh "
+        "turn instead of using Work Tasks"
+    ),
+    "task_destination_change_requires_fresh_turn": (
+        "Selecting a different task-board destination requires a fresh wearer request"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class WorkflowPolicyDenial:
+    error_code: str
+
+    def __post_init__(self) -> None:
+        if self.error_code not in _WORKFLOW_POLICY_ERRORS:
+            raise ValueError("unknown workflow policy denial")
+
+
+def _policy_denial_result(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, WorkflowPolicyDenial):
+        return None
+    return {
+        "success": False,
+        "commit_state": "not_committed",
+        "error_code": value.error_code,
+        "error": _WORKFLOW_POLICY_ERRORS[value.error_code],
+    }
+
+
 class WorkflowRelay:
     """One profile-scoped Unix relay owned by the live platform adapter."""
 
@@ -136,6 +184,9 @@ class WorkflowRelay:
         self._socket_path = relay_paths()
         self._owns_socket_path = False
         self._uses: dict[str, _CapabilityUse] = {}
+        self._task_turn_destinations: dict[
+            tuple[str, str], _TaskTurnDestination
+        ] = {}
         self._uses_lock = asyncio.Lock()
 
     @property
@@ -178,6 +229,7 @@ class WorkflowRelay:
             server.close()
             await server.wait_closed()
         self._uses.clear()
+        self._task_turn_destinations.clear()
         owned, self._owns_socket_path = self._owns_socket_path, False
         if owned:
             try:
@@ -314,6 +366,52 @@ class WorkflowRelay:
                 raise PermissionError("capability replay was rejected")
             previous.max_attempt = attempt
 
+    async def _claim_task_turn_destination(
+        self,
+        claims: Mapping[str, Any],
+        *,
+        workflow: str,
+        workflow_arguments: Mapping[str, Any],
+    ) -> bool:
+        if workflow not in {"g2_work_task_add", "g2_kanban_task_create"}:
+            return True
+        destination = "work_tasks"
+        if workflow == "g2_kanban_task_create":
+            board = workflow_arguments.get("board")
+            if not isinstance(board, str):
+                raise PermissionError("Kanban board is unavailable")
+            canonical_board = unicodedata.normalize("NFC", board).strip().casefold()
+            if not canonical_board:
+                raise PermissionError("Kanban board is unavailable")
+            destination = hashlib.sha256(
+                b"hermes-g2-task-destination:v1\0kanban\0"
+                + canonical_board.encode("utf-8")
+            ).hexdigest()
+        key = (str(claims["session_id"]), str(claims["message_id"]))
+        async with self._uses_lock:
+            # Revalidate while holding the fence lock. An older turn may have
+            # passed the first authorization check and then yielded before a
+            # replacement turn became active.
+            authorization = self._authorize_active_turn(
+                claims,
+                workflow=workflow,
+                workflow_arguments=workflow_arguments,
+            )
+            if _policy_denial_result(authorization) is not None:
+                raise PermissionError("workflow policy changed while claiming board")
+            previous = self._task_turn_destinations.get(key)
+            if previous is not None:
+                return previous.destination == destination
+            # The adapter has just proved this is the one exact active G2 turn.
+            # Retire the prior turn's fence only when a new message identity has
+            # become authoritative; capability expiry must never reopen the
+            # current wearer turn to destination substitution.
+            self._task_turn_destinations.clear()
+            self._task_turn_destinations[key] = _TaskTurnDestination(
+                destination=destination
+            )
+            return True
+
     async def _dispatch(self, request: Any) -> dict[str, Any]:
         fields = {
             "version",
@@ -369,10 +467,15 @@ class WorkflowRelay:
             _log_relay_rejection(_RelayRejectionStage.BINDING)
             return self._error(request_id, "unauthorized")
         try:
-            self._authorize_active_turn(claims)
+            authorization = self._authorize_active_turn(
+                claims,
+                workflow=workflow,
+                workflow_arguments=workflow_arguments,
+            )
         except (PermissionError, TypeError, ValueError, KeyError):
             _log_relay_rejection(_RelayRejectionStage.ACTIVE_TURN)
             return self._error(request_id, "unauthorized")
+        policy_denial = _policy_denial_result(authorization)
         try:
             await self._claim_use(
                 claims,
@@ -385,6 +488,47 @@ class WorkflowRelay:
         except (PermissionError, TypeError, ValueError, KeyError):
             _log_relay_rejection(_RelayRejectionStage.REPLAY)
             return self._error(request_id, "unauthorized")
+        if policy_denial is not None:
+            return {
+                "version": _PROTOCOL_VERSION,
+                "id": request_id,
+                "ok": True,
+                "result": json.dumps(
+                    policy_denial,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            }
+        try:
+            same_destination = await self._claim_task_turn_destination(
+                claims,
+                workflow=workflow,
+                workflow_arguments=workflow_arguments,
+            )
+        except (PermissionError, TypeError, ValueError, KeyError):
+            _log_relay_rejection(_RelayRejectionStage.REPLAY)
+            return self._error(request_id, "unauthorized")
+        if not same_destination:
+            return {
+                "version": _PROTOCOL_VERSION,
+                "id": request_id,
+                "ok": True,
+                "result": json.dumps(
+                    {
+                        "success": False,
+                        "commit_state": "not_committed",
+                        "error_code": (
+                            "task_destination_change_requires_fresh_turn"
+                        ),
+                        "error": (
+                            "Selecting a different task-board destination requires "
+                            "a fresh wearer request"
+                        ),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            }
 
         try:
             from gateway.session_context import clear_session_vars, set_session_vars

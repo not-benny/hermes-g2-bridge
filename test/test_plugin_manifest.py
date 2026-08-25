@@ -13,7 +13,7 @@ def test_manifest_is_transport_only_and_declares_no_model_tools():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
 
     assert manifest["name"] == "hermes-g2-bridge"
-    assert manifest["version"] == "2.1.0"
+    assert manifest["version"] == "2.1.1"
     assert manifest["manifest_version"] == 1
     assert manifest["kind"] == "platform"
     assert manifest["license"] == "Apache-2.0"

@@ -94,7 +94,18 @@ wearer action. The create transaction records the canonical sticky-block event
 as well as the initial status, preventing dependency recomputation from
 promoting a parentless blocked card.
 
-Bridge manifest 2.1.0 enforces cross-board idempotency with an owner-only,
+Bridge manifest 2.1.1 also binds each active wearer turn to the exact Kanban
+board named in that turn. Explicit onboard, local, phone, or Work Tasks wording
+cannot authorize Kanban. A missing or ambiguous selection requires a fresh
+wearer turn, and the model cannot substitute a returned board choice or the
+phone's Work Tasks store in the original turn. Multiple calls to the same
+authorized destination remain valid.
+The fence retains only a domain-separated SHA-256 digest of the normalized
+submitted board identity. A display-name-to-slug spelling change therefore
+fails closed and requires a fresh turn even when both names later resolve to
+one canonical board.
+
+The bridge enforces cross-board idempotency with an owner-only,
 profile-scoped operation ledger rather than relying on the race-tolerant
 per-board lookup alone. The ledger stores a canonical payload digest, never a
 second plaintext copy of title/body. Under a bounded POSIX `flock`, it commits
