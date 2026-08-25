@@ -1,0 +1,5 @@
+pytest>=9,<10
+pytest-asyncio>=1,<2
+PyYAML>=6,<7
+ruff>=0.15,<0.16
+websockets>=14,<18

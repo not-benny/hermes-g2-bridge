@@ -1,0 +1,24 @@
+manifest_version: 1
+api_version: 1
+name: hermes-g2-bridge
+label: Even Realities G2
+kind: platform
+version: 2.0.0
+description: >
+  Authenticated Hermes gateway transport for the Hermes G2 Android app and
+  Even Realities G2 glasses. It carries the private phone Device MCP and the
+  phone-to-host Session MCP, and owns a capability-verified private relay for
+  the separately packaged hermes-g2-workflows MCP. It registers no
+  model-facing tools, skills, commands, or workflow prompt policy.
+author: not-benny and Hermes G2 Bridge contributors
+license: Apache-2.0
+tags: [faceclaw, even-realities, g2, glasses, websocket, mcp]
+python_dependencies:
+  - websockets>=14,<18
+  - playwright>=1.50,<2
+requires_env:
+  - name: HERMES_G2_TOKEN
+    description: Shared secret presented by the Faceclaw phone in its websocket hello frame.
+    prompt: Hermes G2 bridge token
+    password: true
+optional_env: []
