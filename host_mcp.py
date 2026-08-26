@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable
 
 HOST_MCP_CAPABILITY = "host-mcp-v1"
 CONVERSATE_CUES_CAPABILITY = "conversate-cues-v1"
+COCKPIT_FREE_TEXT_CAPABILITY = "cockpit-free-text-v1"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 HOST_MCP_SERVER_VERSION = "1.0.0"
 VOICE_TURN_TOOL = "hermes.voice.turn"
@@ -41,6 +42,7 @@ _MAX_TRANSCRIPT_SCALARS = 4_096
 _MAX_TRANSCRIPT_BYTES = 16_384
 _MAX_CUE_TEXT_SCALARS = 160
 _MAX_CONVERSATE_CUES = 3
+_COCKPIT_REVIEW_TEXT_MAX_SCALARS = 64
 _CONVERSATE_CUE_DEADLINE_SECONDS = 2.5
 _CONVERSATE_CUE_CANCEL_GRACE_SECONDS = 0.05
 _MAX_FINAL_TEXT_SCALARS = 16_384
@@ -73,6 +75,10 @@ _MAX_COCKPIT_SESSIONS = 8
 _MAX_COCKPIT_TIMELINE = 40
 _MAX_COCKPIT_PENDING = 8
 _COCKPIT_INTERACTION_TTL_MS = 5 * 60 * 1000
+# The phone independently rejects Cockpit resource text above 48 KiB and the
+# resource is itself JSON-escaped inside a bounded websocket frame.  Keeping
+# the inner snapshot at 24 KiB leaves deterministic room for that envelope.
+_MAX_COCKPIT_SNAPSHOT_BYTES = 24 * 1024
 
 JsonRpcId = str | int
 SendMessage = Callable[[dict[str, Any]], Awaitable[None]]
@@ -270,7 +276,15 @@ COCKPIT_COMMAND_TOOL_SPEC: dict[str, Any] = {
             "v": {"const": 1},
             "chan": {"const": "cockpit"},
             "connection_generation": {"type": "string", "minLength": 12, "maxLength": 128},
-            "type": {"enum": ["answer", "permission_decide", "steer", "interrupt"]},
+            "type": {
+                "enum": [
+                    "answer",
+                    "answer_text",
+                    "permission_decide",
+                    "steer",
+                    "interrupt",
+                ]
+            },
             "command_id": {"type": "string", "pattern": r"^[A-Za-z0-9._-]{12,128}$"},
             "session_id": {"type": "string", "pattern": r"^[A-Za-z0-9._-]{12,128}$"},
             "generation": {"type": "integer", "minimum": 1, "maximum": _MAX_SAFE_INTEGER},
@@ -278,7 +292,12 @@ COCKPIT_COMMAND_TOOL_SPEC: dict[str, Any] = {
             "nonce": {"type": "string", "pattern": r"^[A-Za-z0-9._-]{12,128}$"},
             "choice_id": {"type": "string", "pattern": r"^[A-Za-z0-9._-]{12,128}$"},
             "decision": {"enum": ["deny", "allow_once"]},
-            "text": {"type": "string", "minLength": 1, "maxLength": 500},
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": _COCKPIT_REVIEW_TEXT_MAX_SCALARS,
+                "pattern": r"^(?!.*[<>`])[\x21-\x7E](?:[\x20-\x7E]*[\x21-\x7E])?$",
+            },
         },
         "required": [
             "v", "chan", "connection_generation", "type", "command_id", "session_id", "generation"
@@ -288,6 +307,16 @@ COCKPIT_COMMAND_TOOL_SPEC: dict[str, Any] = {
                 "properties": {"type": {"const": "answer"}},
                 "required": ["request_id", "nonce", "choice_id"],
                 "not": {"anyOf": [{"required": ["decision"]}, {"required": ["text"]}]},
+            },
+            {
+                "properties": {"type": {"const": "answer_text"}},
+                "required": ["request_id", "nonce", "text"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["choice_id"]},
+                        {"required": ["decision"]},
+                    ]
+                },
             },
             {
                 "properties": {"type": {"const": "permission_decide"}},
@@ -569,6 +598,26 @@ def _cockpit_text(value: Any, maximum: int, fallback: str) -> str:
     return result[:maximum]
 
 
+def _cockpit_review_text(value: Any) -> str | None:
+    """Return only unchanged text proven to fit the 640x480 review."""
+    if not isinstance(value, str):
+        return None
+    # Never trim or normalize text after the wearer reviewed it. Leading or
+    # trailing whitespace is rejected because the native renderer does not
+    # make that authority-bearing difference reliably visible.
+    if (
+        not value
+        or value != value.strip()
+        or len(value) > _COCKPIT_REVIEW_TEXT_MAX_SCALARS
+    ):
+        return None
+    if any(ord(character) < 0x20 or ord(character) > 0x7E for character in value):
+        return None
+    if any(character in "<>`" for character in value):
+        return None
+    return value
+
+
 def _cockpit_id(prefix: str, seed: str | None = None) -> str:
     entropy = seed if seed is not None else secrets.token_hex(24)
     digest = hashlib.sha256(entropy.encode("utf-8")).hexdigest()[:32]
@@ -584,6 +633,7 @@ def _normalize_cockpit_command(arguments: Any, session_generation: str) -> dict[
     command_type = arguments.get("type")
     extras = {
         "answer": {"request_id", "nonce", "choice_id"},
+        "answer_text": {"request_id", "nonce", "text"},
         "permission_decide": {"request_id", "nonce", "decision"},
         "steer": {"text"},
         "interrupt": set(),
@@ -603,7 +653,7 @@ def _normalize_cockpit_command(arguments: Any, session_generation: str) -> dict[
         or not 1 <= arguments["generation"] <= _MAX_SAFE_INTEGER
     ):
         return None
-    if command_type in {"answer", "permission_decide"}:
+    if command_type in {"answer", "answer_text", "permission_decide"}:
         if not all(
             isinstance(arguments.get(name), str) and _COCKPIT_ID.fullmatch(arguments[name])
             for name in ("request_id", "nonce")
@@ -618,9 +668,9 @@ def _normalize_cockpit_command(arguments: Any, session_generation: str) -> dict[
         "deny", "allow_once"
     }:
         return None
-    if command_type == "steer":
-        text = _safe_one_line(arguments.get("text"), max_scalars=500)
-        if text is None or any(character in "<>`" for character in text):
+    if command_type in {"answer_text", "steer"}:
+        text = _cockpit_review_text(arguments.get("text"))
+        if text is None:
             return None
         arguments = {**arguments, "text": text}
     return dict(arguments)
@@ -645,6 +695,7 @@ class HostSessionMcpServer:
         on_cockpit_command: Callable[
             [dict[str, Any], dict[str, Any] | None], Awaitable[tuple[str, str | None]]
         ] | None = None,
+        cockpit_free_text_enabled: bool = False,
         profile: str | None = None,
     ) -> None:
         if not isinstance(session_generation, str) or not _SESSION_GENERATION.fullmatch(
@@ -655,6 +706,8 @@ class HostSessionMcpServer:
             not isinstance(profile, str) or not _TURN_ID.fullmatch(profile)
         ):
             raise ValueError("host MCP profile is invalid")
+        if not isinstance(cockpit_free_text_enabled, bool):
+            raise ValueError("Cockpit free-text negotiation is invalid")
         self._send = send
         self._session_generation = session_generation
         self._on_voice_turn = on_voice_turn
@@ -662,6 +715,7 @@ class HostSessionMcpServer:
         self._on_conversate_cues = on_conversate_cues
         self._on_fatal = on_fatal
         self._on_cockpit_command = on_cockpit_command
+        self._cockpit_free_text_enabled = cockpit_free_text_enabled
         self._profile = profile
         self._lifecycle = "new"
         self._closed = False
@@ -1138,7 +1192,7 @@ class HostSessionMcpServer:
                 changed = True
         if changed:
             self._cockpit_sequence += 1
-        return {
+        snapshot = {
             "v": 1,
             "chan": "cockpit",
             "type": "snapshot",
@@ -1149,6 +1203,78 @@ class HostSessionMcpServer:
                 for record in self._cockpit_sessions.values()
             ],
         }
+        return self._bound_cockpit_snapshot(snapshot)
+
+    @staticmethod
+    def _cockpit_snapshot_size(snapshot: dict[str, Any]) -> int:
+        return len(
+            json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    @classmethod
+    def _bound_cockpit_snapshot(
+        cls, snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fit the authoritative projection inside both MCP and WSS bounds."""
+        if cls._cockpit_snapshot_size(snapshot) <= _MAX_COCKPIT_SNAPSHOT_BYTES:
+            return snapshot
+
+        sessions = snapshot["sessions"]
+        # Timeline rows are informational, never authority. Discard the oldest
+        # rows from terminal/old sessions first while retaining live requests.
+        while cls._cockpit_snapshot_size(snapshot) > _MAX_COCKPIT_SNAPSHOT_BYTES:
+            with_timeline = [item for item in sessions if item["timeline"]]
+            if not with_timeline:
+                break
+            selected = min(
+                with_timeline,
+                key=lambda item: (
+                    item["state"] not in {"completed", "failed", "interrupted"},
+                    item["updated_at_ms"],
+                    item["session_id"],
+                ),
+            )
+            selected["timeline"].pop(0)
+
+        # At the theoretical pending maximum, show the oldest reviewed work
+        # first. Hidden requests retain no phone authority and become visible
+        # after a sequence-changing resolution/expiry removes earlier work.
+        while cls._cockpit_snapshot_size(snapshot) > _MAX_COCKPIT_SNAPSHOT_BYTES:
+            with_pending = [item for item in sessions if item["pending"]]
+            if not with_pending:
+                break
+            selected = max(
+                with_pending,
+                key=lambda item: (
+                    len(item["pending"]),
+                    -item["updated_at_ms"],
+                    item["session_id"],
+                ),
+            )
+            selected["pending"].pop()
+
+        # Session metadata alone is far below the limit under the fixed field
+        # bounds. This final fail-closed guard protects against future schema
+        # growth without ever emitting a document the phone must reject.
+        while (
+            cls._cockpit_snapshot_size(snapshot) > _MAX_COCKPIT_SNAPSHOT_BYTES
+            and sessions
+        ):
+            selected = min(
+                sessions,
+                key=lambda item: (
+                    item["state"] not in {"completed", "failed", "interrupted"},
+                    item["updated_at_ms"],
+                    item["session_id"],
+                ),
+            )
+            sessions.remove(selected)
+        return snapshot
 
     async def open_cockpit_turn(
         self,
@@ -1230,23 +1356,31 @@ class HostSessionMcpServer:
         )
         if request_id in record.backends:
             return True
+        title = _cockpit_review_text(question)
+        if title is None:
+            return False
         projected_choices: list[dict[str, str]] = []
         choice_values: dict[str, str] = {}
         for index, raw_choice in enumerate(choices):
             original = str(raw_choice)
+            label = _cockpit_review_text(original)
+            if label is None:
+                return False
             choice_id = _cockpit_id("choice", f"{request_id}:{index}")
             projected_choices.append(
                 {
                     "id": choice_id,
-                    "label": _cockpit_text(original, 120, f"Choice {index + 1}"),
+                    "label": label,
                 }
             )
-            choice_values[choice_id] = original
+            # label is an identity transform: the dispatched answer is exactly
+            # what the wearer reviewed, never the pre-review provider value.
+            choice_values[choice_id] = label
         interaction = {
             "request_id": request_id,
             "nonce": _cockpit_id("nonce"),
             "kind": "question",
-            "title": _cockpit_text(question, 160, "Hermes needs an answer"),
+            "title": title,
             "expires_at_ms": int(time.time() * 1000) + _COCKPIT_INTERACTION_TTL_MS,
             "choices": projected_choices,
         }
@@ -1255,6 +1389,50 @@ class HostSessionMcpServer:
             "clarify_id": clarify_id,
             "session_key": session_key,
             "choice_values": choice_values,
+        }
+        record.document["pending"].append(interaction)
+        self._touch_record(record, state="waiting_human")
+        self._cockpit_sequence += 1
+        await self._notify_cockpit_updated()
+        return True
+
+    async def open_cockpit_text_question(
+        self,
+        binding: HostTurnBinding,
+        *,
+        clarify_id: str,
+        session_key: str,
+        question: str,
+    ) -> bool:
+        """Project one negotiated, bounded open clarification."""
+        record = self._record_for_binding(binding)
+        if (
+            not self._cockpit_free_text_enabled
+            or record is None
+            or len(record.document["pending"]) >= _MAX_COCKPIT_PENDING
+        ):
+            return False
+        request_id = _cockpit_id(
+            "request", f"{record.document['session_id']}:text-question:{clarify_id}"
+        )
+        if request_id in record.backends:
+            return True
+        title = _cockpit_review_text(question)
+        if title is None:
+            return False
+        interaction = {
+            "request_id": request_id,
+            "nonce": _cockpit_id("nonce"),
+            "kind": "text_question",
+            "title": title,
+            "expires_at_ms": int(time.time() * 1000)
+            + _COCKPIT_INTERACTION_TTL_MS,
+            "max_length": _COCKPIT_REVIEW_TEXT_MAX_SCALARS,
+        }
+        record.backends[request_id] = {
+            "kind": "text_question",
+            "clarify_id": clarify_id,
+            "session_key": session_key,
         }
         record.document["pending"].append(interaction)
         self._touch_record(record, state="waiting_human")
@@ -1281,16 +1459,19 @@ class HostSessionMcpServer:
         )
         if request_id in record.backends:
             return True
+        target = _cockpit_review_text(command)
+        effect = _cockpit_review_text(description)
+        render_safe = target is not None and effect is not None
         interaction = {
             "request_id": request_id,
             "nonce": _cockpit_id("nonce"),
             "kind": "permission",
-            "title": _cockpit_text(description, 160, "Command approval required"),
+            "title": "Command approval required",
             "expires_at_ms": int(time.time() * 1000) + _COCKPIT_INTERACTION_TTL_MS,
             "action": "other_bounded",
-            "target": _cockpit_text(command, 240, "Redacted command"),
-            "effect": _cockpit_text(description, 240, "Run this command once"),
-            "choices": ["deny", "allow_once"] if allow_once else ["deny"],
+            "target": target if render_safe else "Details unavailable",
+            "effect": effect if render_safe else "Approval disabled: details exceed safe display bounds",
+            "choices": ["deny", "allow_once"] if allow_once and render_safe else ["deny"],
         }
         record.backends[request_id] = {
             "kind": "permission",
@@ -1409,7 +1590,11 @@ class HostSessionMcpServer:
             self._cockpit_commands.add(command_id)
             code = self._validate_cockpit_authority(record, command)
             if code is None and self._on_cockpit_command is not None:
-                if command["type"] in {"answer", "permission_decide"}:
+                if command["type"] in {
+                    "answer",
+                    "answer_text",
+                    "permission_decide",
+                }:
                     backend = record.backends.get(command["request_id"]) if record else None
                 try:
                     outcome, code = await self._on_cockpit_command(command, backend)
@@ -1420,7 +1605,11 @@ class HostSessionMcpServer:
             elif code is None:
                 code = "backend_authority_unavailable"
         if outcome == "accepted" and record is not None:
-            if command["type"] in {"answer", "permission_decide"}:
+            if command["type"] in {
+                "answer",
+                "answer_text",
+                "permission_decide",
+            }:
                 request = command["request_id"]
                 record.document["pending"] = [
                     item for item in record.document["pending"] if item["request_id"] != request
@@ -1483,9 +1672,12 @@ class HostSessionMcpServer:
             ),
             None,
         )
-        if request is None or request["kind"] != (
-            "question" if command_type == "answer" else "permission"
-        ):
+        expected_kind = {
+            "answer": "question",
+            "answer_text": "text_question",
+            "permission_decide": "permission",
+        }.get(command_type)
+        if request is None or request["kind"] != expected_kind:
             return "stale_request"
         if request["nonce"] != command["nonce"]:
             return "stale_nonce"
@@ -1495,15 +1687,13 @@ class HostSessionMcpServer:
             choice["id"] == command["choice_id"] for choice in request["choices"]
         ):
             return "invalid_choice"
+        if command_type == "answer_text" and (
+            len(command["text"]) > request["max_length"]
+            or _cockpit_review_text(command["text"]) != command["text"]
+        ):
+            return "invalid_text_answer"
         if command_type == "permission_decide" and command["decision"] not in request["choices"]:
             return "invalid_decision"
-        if command_type == "permission_decide":
-            first_permission = next(
-                (item for item in record.document["pending"] if item["kind"] == "permission"),
-                None,
-            )
-            if first_permission is not request:
-                return "permission_not_oldest"
         return None
 
     async def _notify_cockpit_updated(self) -> None:

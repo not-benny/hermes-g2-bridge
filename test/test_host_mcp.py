@@ -672,6 +672,7 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
         on_voice_turn=on_voice_turn,
         on_cancel=on_cancel,
         on_cockpit_command=on_command,
+        cockpit_free_text_enabled=True,
         profile="even-g2",
     )
     await _initialize(server, sent)
@@ -701,12 +702,25 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
         question="Which target?",
         choices=["Staging", "Production"],
     )
+    assert await server.open_cockpit_text_question(
+        binding,
+        clarify_id="clarify-text-1",
+        session_key="g2:glasses",
+        question="Name the release?",
+    )
     assert await server.open_cockpit_permission(
         binding,
         session_key="g2:glasses",
         approval_request_id="approval-backend-1",
         command="deploy --staging",
         description="Deploy once",
+    )
+    assert await server.open_cockpit_permission(
+        binding,
+        session_key="g2:glasses",
+        approval_request_id="approval-oversized-1",
+        command="W" * 65,
+        description="Hidden suffix must not be approvable",
     )
 
     async def snapshot(request_id):
@@ -723,11 +737,16 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
     session = state["sessions"][0]
     assert session["state"] == "waiting_human"
     assert session["timeline"][0]["kind"] == "user"
-    question, permission = session["pending"]
+    question, text_question, permission, oversized_permission = session["pending"]
+    assert text_question["kind"] == "text_question"
+    assert text_question["max_length"] == 64
+    assert oversized_permission["choices"] == ["deny"]
+    assert oversized_permission["target"] == "Details unavailable"
+    assert oversized_permission["effect"] == "Approval disabled: details exceed safe display bounds"
 
     serial = 0
 
-    async def submit(arguments):
+    async def submit(arguments, expected_outcome="accepted"):
         nonlocal serial
         serial += 1
         request_id = f"cockpit-command-{serial}"
@@ -737,7 +756,7 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
         })
         response = next(item for item in reversed(sent) if item.get("id") == request_id)
         receipt = json.loads(response["result"]["content"][0]["text"])
-        assert receipt["outcome"] == "accepted"
+        assert receipt["outcome"] == expected_outcome
         return receipt
 
     base = {
@@ -754,6 +773,32 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
         "request_id": question["request_id"],
         "nonce": question["nonce"],
         "choice_id": question["choices"][0]["id"],
+    })
+    await submit({
+        **base,
+        "type": "answer_text",
+        "command_id": "command_answer_text_1",
+        "request_id": text_question["request_id"],
+        "nonce": text_question["nonce"],
+        "text": "Hermes One",
+    })
+    # The exact selected permission is authoritative; a later projected
+    # permission must not be rejected merely because another remains earlier.
+    await submit({
+        **base,
+        "type": "permission_decide",
+        "command_id": "command_oversized_forged_allow",
+        "request_id": oversized_permission["request_id"],
+        "nonce": oversized_permission["nonce"],
+        "decision": "allow_once",
+    }, "rejected")
+    await submit({
+        **base,
+        "type": "permission_decide",
+        "command_id": "command_oversized_deny",
+        "request_id": oversized_permission["request_id"],
+        "nonce": oversized_permission["nonce"],
+        "decision": "deny",
     })
     await submit({
         **base,
@@ -775,11 +820,14 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
         "command_id": "command_interrupt_1",
     })
     assert [item[0]["type"] for item in dispatched] == [
-        "answer", "permission_decide", "steer", "interrupt"
+        "answer", "answer_text", "permission_decide", "permission_decide",
+        "steer", "interrupt"
     ]
     assert dispatched[0][1]["clarify_id"] == "clarify-real-1"
-    assert dispatched[1][1]["session_key"] == "g2:glasses"
-    assert dispatched[1][1]["approval_request_id"] == "approval-backend-1"
+    assert dispatched[1][1]["clarify_id"] == "clarify-text-1"
+    assert dispatched[2][1]["approval_request_id"] == "approval-oversized-1"
+    assert dispatched[3][1]["session_key"] == "g2:glasses"
+    assert dispatched[3][1]["approval_request_id"] == "approval-backend-1"
 
     state = await snapshot("cockpit-state-2")
     assert state["sessions"][0]["state"] == "interrupting"
@@ -790,6 +838,57 @@ async def test_live_cockpit_snapshot_and_all_exact_commands_dispatch(plugin_pack
     state = await snapshot("cockpit-state-3")
     assert state["sessions"][0]["state"] == "interrupted"
     assert state["sessions"][0]["timeline"][-1]["kind"] == "status"
+
+    record = server._cockpit_sessions[session_id]
+    record.document["timeline"] = [
+        {
+            "id": f"timeline_{index:012d}",
+            "kind": "assistant",
+            "text": "💬" * 240,
+            "status": "done",
+        }
+        for index in range(40)
+    ]
+    bounded = server._cockpit_snapshot()
+    assert len(json.dumps(
+        bounded, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")) <= module._MAX_COCKPIT_SNAPSHOT_BYTES
+    assert len(bounded["sessions"][0]["timeline"]) < 40
+
+
+def test_cockpit_exact_review_and_command_schema_are_identity_bound(plugin_package):
+    module = importlib.import_module(f"{plugin_package.__name__}.host_mcp")
+    assert module._cockpit_review_text("Staging") == "Staging"
+    assert module._cockpit_review_text(" Staging") is None
+    assert module._cockpit_review_text("Staging ") is None
+    assert module._cockpit_review_text("W" * 65) is None
+    schema = module.COCKPIT_COMMAND_TOOL_SPEC["inputSchema"]
+    assert "answer_text" in schema["properties"]["type"]["enum"]
+    assert schema["properties"]["text"]["maxLength"] == 64
+    assert module._normalize_cockpit_command({
+        "v": 1,
+        "chan": "cockpit",
+        "connection_generation": "host_connection_test",
+        "type": "answer_text",
+        "command_id": "command_text_12345",
+        "session_id": "session_text_12345",
+        "generation": 1,
+        "request_id": "request_text_12345",
+        "nonce": "nonce_text_123456",
+        "text": "Exact answer",
+    }, "host_connection_test")["text"] == "Exact answer"
+    assert module._normalize_cockpit_command({
+        "v": 1,
+        "chan": "cockpit",
+        "connection_generation": "host_connection_test",
+        "type": "answer_text",
+        "command_id": "command_text_space",
+        "session_id": "session_text_12345",
+        "generation": 1,
+        "request_id": "request_text_12345",
+        "nonce": "nonce_text_123456",
+        "text": " Exact answer",
+    }, "host_connection_test") is None
 
 
 @pytest.mark.asyncio

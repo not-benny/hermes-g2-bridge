@@ -30,6 +30,7 @@ from websockets.exceptions import ConnectionClosed
 
 from . import runtime
 from .host_mcp import (
+    COCKPIT_FREE_TEXT_CAPABILITY,
     CONVERSATE_CUES_CAPABILITY,
     HOST_MCP_CAPABILITY,
     HostConversateCuesRequest,
@@ -607,6 +608,9 @@ class G2Adapter(BasePlatformAdapter):
         conversate_cues_negotiated = (
             CONVERSATE_CUES_CAPABILITY in client_capabilities
         )
+        cockpit_free_text_negotiated = (
+            COCKPIT_FREE_TEXT_CAPABILITY in client_capabilities
+        )
         if not host_mcp_negotiated:
             raise PermissionError("host-mcp-v1 was not negotiated")
 
@@ -734,6 +738,7 @@ class G2Adapter(BasePlatformAdapter):
             ),
             on_fatal=retire_exhausted_host_mcp,
             on_cockpit_command=dispatch_host_cockpit_command,
+            cockpit_free_text_enabled=cockpit_free_text_negotiated,
             profile=self.hello_profile or None,
         )
         phone = _Phone(
@@ -756,6 +761,11 @@ class G2Adapter(BasePlatformAdapter):
                     *(
                         [CONVERSATE_CUES_CAPABILITY]
                         if conversate_cues_negotiated
+                        else []
+                    ),
+                    *(
+                        [COCKPIT_FREE_TEXT_CAPABILITY]
+                        if cockpit_free_text_negotiated
                         else []
                     ),
                 ],
@@ -1186,10 +1196,17 @@ class G2Adapter(BasePlatformAdapter):
         if turn is None:
             return "rejected", "active_g2_turn_stale"
         command_type = command.get("type")
-        if command_type == "answer":
-            if not backend or backend.get("kind") != "question":
+        if command_type in {"answer", "answer_text"}:
+            expected_kind = (
+                "question" if command_type == "answer" else "text_question"
+            )
+            if not backend or backend.get("kind") != expected_kind:
                 return "rejected", "question_backend_stale"
-            choice = (backend.get("choice_values") or {}).get(command.get("choice_id"))
+            choice = (
+                (backend.get("choice_values") or {}).get(command.get("choice_id"))
+                if command_type == "answer"
+                else command.get("text")
+            )
             if not isinstance(choice, str):
                 return "rejected", "question_choice_stale"
             try:
@@ -1270,7 +1287,7 @@ class G2Adapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Project listed Hermes questions into the authenticated Host-MCP Cockpit."""
+        """Project listed or explicitly negotiated open Cockpit questions."""
         del chat_id, metadata
         turn = self._turns.get(self._active_turn_id or "")
         phone = self._phone
@@ -1280,19 +1297,26 @@ class G2Adapter(BasePlatformAdapter):
             or turn.finished
             or turn.host_binding is None
             or turn.session_key != session_key
-            or not choices
         ):
             return SendResult(
                 success=False,
-                error="G2 Cockpit supports only listed choices on the active turn",
+                error="G2 Cockpit clarification projection is unavailable",
             )
-        opened = await phone.host_mcp.open_cockpit_question(
-            turn.host_binding,
-            clarify_id=clarify_id,
-            session_key=session_key,
-            question=question,
-            choices=choices,
-        )
+        if choices:
+            opened = await phone.host_mcp.open_cockpit_question(
+                turn.host_binding,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                question=question,
+                choices=choices,
+            )
+        else:
+            opened = await phone.host_mcp.open_cockpit_text_question(
+                turn.host_binding,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                question=question,
+            )
         return SendResult(
             success=opened,
             message_id=f"g2-cockpit-{clarify_id}" if opened else None,

@@ -13,7 +13,10 @@ The authenticated phone WebSocket multiplexes two independent MCP sessions:
   server. It owns voice-turn submission/cancellation and the bounded read-only
   Cockpit connection/status resource. When both peers explicitly negotiate
   `conversate-cues-v1`, it also owns the bounded `hermes.conversate.cues`
-  auxiliary side lane. Companion is deliberately unavailable.
+  auxiliary side lane. When both peers explicitly negotiate
+  `cockpit-free-text-v1`, a pending clarification may additionally accept one
+  exact printable-ASCII answer of at most 64 scalars. Companion is deliberately
+  unavailable.
 - **G2 Device MCP** (`mcp`): Hermes is the client and the phone is the server.
   It owns phone/glasses tools. A call is authorized by connection-bound host
   state; model arguments never grant a turn, profile, device, or proactive
@@ -74,7 +77,7 @@ rejected.
 | Completed background result | Deterministic native producer → durable phone queue | Internal-only; not a model tool |
 | One-shot reminder creation and fire | Workflow MCP → deterministic native outbox → fixed device MCP notify | Active |
 | Context deck presentation | Intent-specific workflows → fixed server-authored deck | Weather/train only; generic present/pins deliberately not exposed |
-| Cockpit current/recent G2 sessions and reviewed commands | Host Session MCP state resource + exact command tool | Active; listed-choice answer, deny/allow-once, steer, and interrupt only |
+| Cockpit current/recent G2 sessions and reviewed commands | Host Session MCP state resource + exact command tool | Active; listed-choice answer, negotiated 64-scalar free-text answer, deny/allow-once, steer, and interrupt. Reviewed text is dispatched byte-for-byte without trimming/normalization. Allow-once target/effect are exact printable ASCII capped at 64 scalars for full 640x480 lens rendering; longer or unrepresentable scope is deny-only. Snapshots are capped at 24 KiB before nested MCP/WSS encoding. |
 | Companion | None | Deliberately unavailable; legacy custom frames are inert |
 | Home Assistant | Separate user-configured MCP | Remove personal aliases/policy from release profile |
 | Calendar / printers | Separate user-configured MCPs | Remove recipes from release profile |

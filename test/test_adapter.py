@@ -37,6 +37,8 @@ async def _authenticate_and_serve_mcp(
     expected = ["host-mcp-v1"]
     if "conversate-cues-v1" in capabilities:
         expected.append("conversate-cues-v1")
+    if "cockpit-free-text-v1" in capabilities:
+        expected.append("cockpit-free-text-v1")
     assert ack["capabilities"] == expected
     return ack
 
@@ -199,6 +201,16 @@ async def test_conversate_cue_tool_is_exposed_only_when_both_sides_negotiate(ada
             "hermes.cockpit.command",
             "hermes.conversate.cues",
         ]
+
+
+@pytest.mark.asyncio
+async def test_cockpit_free_text_is_echoed_only_when_both_sides_negotiate(adapter):
+    assert await adapter.connect()
+    async with websockets.connect(f"ws://127.0.0.1:{adapter.bound_port}") as phone:
+        ack = await _authenticate_and_serve_mcp(
+            phone, capabilities=["host-mcp-v1", "cockpit-free-text-v1"]
+        )
+        assert ack["capabilities"] == ["host-mcp-v1", "cockpit-free-text-v1"]
 
 
 @pytest.mark.asyncio
@@ -640,6 +652,16 @@ async def test_cockpit_dispatch_reaches_exact_live_hermes_authority(
             },
         ) == ("accepted", None)
         assert clarify_resolutions == [("clarify-live", "Staging")]
+
+        assert await adapter._dispatch_cockpit_command(
+            {**base, "type": "answer_text", "text": "Hermes One"},
+            {
+                "kind": "text_question",
+                "session_key": turn.session_key,
+                "clarify_id": "clarify-text-live",
+            },
+        ) == ("accepted", None)
+        assert clarify_resolutions[-1] == ("clarify-text-live", "Hermes One")
 
         assert await adapter._dispatch_cockpit_command(
             {**base, "type": "permission_decide", "decision": "allow_once"},
